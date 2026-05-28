@@ -1,0 +1,21 @@
+{
+  "name": "cairn-cli",
+  "version": "0.1.0",
+  "description": "Command-line client for a Cairn signal board on Compute Substrate — browse, propose, and back what to build.",
+  "type": "module",
+  "bin": { "cairn": "dist/cli.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "prepare": "tsc"
+  },
+  "keywords": ["cairn", "compute-substrate", "cli"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

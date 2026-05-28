@@ -1,0 +1,19 @@
+# build + deps
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# secrets / local
+.env
+.env.*
+**/*key*.json
+**/wallet*.txt
+*.log
+
+# packaging / OS
+*.tgz
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
