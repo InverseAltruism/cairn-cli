@@ -181,6 +181,7 @@ async function help() {
   console.log(c.gray("\n  lenses (--sort): " + Object.keys(LENS).join(" · ")));
   console.log(c.gray(`  api: ${CAIRN_API}  ·  1 CSD = ${CSD_PER_COIN} base · propose ≥ ${MIN_FEE_PROPOSE} · attest ≥ ${MIN_FEE_ATTEST}`));
   console.log(c.gray("  config: CAIRN_API (board url) · CAIRN_TOKEN (instance write token, to post) · CAIRN_RPC (trustless verify)"));
+  console.log(c.gray("  display: honors NO_COLOR · --no-color · --no-anim · TERM=dumb (color/animation auto-off when piped)"));
   console.log(c.gray("  keyless non-custodial posting + sealed claims: use the Cairn Wallet (browser extension)."));
 }
 
