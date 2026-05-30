@@ -28,13 +28,22 @@ const age = (sec: number) => {
   return d < 3600 ? `${Math.floor(d / 60)}m` : d < 86400 ? `${Math.floor(d / 3600)}h` : `${Math.floor(d / 86400)}d`;
 };
 
-function printRows(items: any[]) {
+// Lenses: each is one transparent reading of the same on-chain data (matches the web
+// UI). The board returns all of these precomputed; we just sort client-side by one.
+const LENS: Record<string, string> = {
+  totalWeight: "CSD support (raw)", quadratic: "quadratic", repWeight: "reputation-weighted",
+  conviction: "conviction", supporterCount: "# supporters", createdHeight: "newest",
+};
+function printRows(items: any[], sort = "totalWeight") {
   if (!items.length) { console.log(c.gray("  (no items here)")); return; }
-  const max = items[0].totalWeight || 1;
+  const max = items[0]?.[sort] || items[0]?.totalWeight || 1;
   items.slice(0, 25).forEach((r, i) => {
+    // annotate only lenses whose value isn't already shown in the row (raw + supporters are)
+    const lens = !["totalWeight", "supporterCount"].includes(sort) && r[sort] != null
+      ? c.gray(" · " + (sort === "createdHeight" ? "h" + r[sort] : csdFmt(r[sort]) + " " + sort)) : "";
     console.log("");
-    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))}  ${c.white(c.bold(r.title))}  ${badge(r.source)}`);
-    console.log(`      ${bar(r.totalWeight, max)}  ${csdFmt(r.totalWeight)} ${c.gray("·")} ${c.green(String(r.supporterCount))} ${c.gray("supporters · score " + r.avgScore + " · " + age(r.createdTime) + " ago")}`);
+    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))}  ${c.white(c.bold(r.title))}  ${badge(r.source)}${r.sealed ? "  " + c.gray(r.revealed ? "🔓 revealed" : "🔒 sealed") : ""}`);
+    console.log(`      ${bar(r[sort] || r.totalWeight, max)}  ${csdFmt(r.totalWeight)} ${c.gray("·")} ${c.green(String(r.supporterCount))} ${c.gray("supporters · score " + r.avgScore + " · " + age(r.createdTime) + " ago")}${lens}`);
     console.log(c.gray(`      ${r.domain} · id ${String(r.id).slice(0, 22)}…`));
   });
 }
@@ -42,11 +51,14 @@ function printRows(items: any[]) {
 async function cmdList(a: Args) {
   const domain = a._[1] ?? "all";
   const window = String(a.flags.window ?? "all");
+  const sort = LENS[String(a.flags.sort ?? "")] ? String(a.flags.sort) : "totalWeight";
   const r = await api.apiBoard(domain, window);
-  if (a.flags.json) { console.log(JSON.stringify(r.items, null, 2)); return; }
+  let items = r.items ?? [];
+  if (sort !== "totalWeight") items = items.slice().sort((x: any, y: any) => (y[sort] || 0) - (x[sort] || 0));
+  if (a.flags.json) { console.log(JSON.stringify(items, null, 2)); return; }
   banner();
-  rule(`${domain} · by ${window} support · ${CAIRN_API.replace(/^https?:\/\//, "")}`);
-  printRows(r.items);
+  rule(`${domain} · ${LENS[sort]} · ${window} · ${CAIRN_API.replace(/^https?:\/\//, "")}`);
+  printRows(items, sort);
 }
 
 async function cmdWatch(a: Args) {
@@ -144,15 +156,21 @@ async function cmdSupport(a: Args) {
 async function cmdDomains() {
   const r = await api.apiDomains();
   banner(); rule("categories");
-  for (const dom of r.domains ?? []) console.log(`  ${c.cyan(pad(dom.key, 18))} ${c.white(dom.title)} ${c.gray(dom.count != null ? "(" + dom.count + ")" : "")}`);
+  for (const dom of r.domains ?? []) console.log(`  ${c.cyan(pad(dom.key, 20))} ${c.white(dom.title)} ${c.gray(dom.count != null ? "(" + dom.count + ")" : "")}`);
+  // open domains: anyone can create one by proposing into it (cairn ls <domain> works for any).
+  const disc = r.discovered ?? [];
+  if (disc.length) {
+    console.log(c.gray("\n  open domains (created by proposing into them):"));
+    for (const d of disc) console.log(`  ${c.cyan(pad(d.key, 20))} ${c.gray((d.count != null ? d.count + " items" : "") + (d.totalWeight ? " · " + csdToCoins(d.totalWeight) + " CSD" : ""))}`);
+  }
 }
 
 async function help() {
   await bannerAnimated();
   const cmd = (n: string, args: string, d: string) => console.log(`  ${c.cyan(pad(n, 9))} ${c.gray(pad(args, 44))} ${c.dim(d)}`);
   console.log(c.bold("  commands"));
-  cmd("domains", "", "list categories");
-  cmd("ls", "[domain] --window trending|7d|30d|all", "browse the board (+ --json)");
+  cmd("domains", "", "list categories + open domains");
+  cmd("ls", "[domain] --window trending|7d|30d|all --sort <lens>", "browse the board (+ --json)");
   cmd("top", "[domain]", "alias for ls");
   cmd("watch", "[domain]", "live auto-refreshing board");
   cmd("recent", "", "recent proposals + support");
@@ -160,8 +178,10 @@ async function help() {
   cmd("verify", "<id>", "recompute hash, check vs chain");
   cmd("propose", "--domain <d> --title <t> --body <b>", "post an item (needs CAIRN_TOKEN)");
   cmd("support", "<id> --fee <base>", "back an item (needs CAIRN_TOKEN)");
-  console.log(c.gray(`\n  api: ${CAIRN_API}  ·  1 CSD = ${CSD_PER_COIN} base · propose ≥ ${MIN_FEE_PROPOSE} · attest ≥ ${MIN_FEE_ATTEST}`));
-  console.log(c.gray("  config: CAIRN_API (board url) · CAIRN_TOKEN (to post) · CAIRN_RPC (trustless verify)"));
+  console.log(c.gray("\n  lenses (--sort): " + Object.keys(LENS).join(" · ")));
+  console.log(c.gray(`  api: ${CAIRN_API}  ·  1 CSD = ${CSD_PER_COIN} base · propose ≥ ${MIN_FEE_PROPOSE} · attest ≥ ${MIN_FEE_ATTEST}`));
+  console.log(c.gray("  config: CAIRN_API (board url) · CAIRN_TOKEN (instance write token, to post) · CAIRN_RPC (trustless verify)"));
+  console.log(c.gray("  keyless non-custodial posting + sealed claims: use the Cairn Wallet (browser extension)."));
 }
 
 async function main() {
