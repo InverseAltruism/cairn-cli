@@ -1,6 +1,6 @@
 {
   "name": "@inversealtruism/cairn-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Command-line client for a Cairn signal board on Compute Substrate — browse, propose, and back what to build.",
   "type": "module",
   "bin": { "cairn": "dist/cli.js" },
