@@ -41,6 +41,11 @@ cairn watch                  # live auto-refreshing board
 cairn recent                 # recent proposals and support
 cairn show   <id>            # item detail and integrity check
 cairn verify <id>            # recompute the content hash and check it
+cairn wall                   # the Wall — top stones + the reigning King
+cairn network                # live network telemetry (alias: cairn stats)
+cairn quests                 # open quests
+cairn profile <addr>         # identity + on-chain reputation
+cairn leaderboard            # top builders by reputation
 cairn ls --json              # machine-readable output
 ```
 

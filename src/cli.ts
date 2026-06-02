@@ -165,6 +165,80 @@ async function cmdDomains() {
   }
 }
 
+async function cmdWall() {
+  const r = await api.apiWall();
+  const stones = r.stones ?? [];
+  banner(); rule(`the wall · ${r.totals?.stones ?? 0} stones · ${r.totals?.boosts ?? 0} boosts · epoch ${r.epoch ?? "?"}`);
+  if (r.king) console.log(`  ${c.green("★ KING")}  ${c.white(c.bold(r.king.message))}  ${csdFmt(r.king.weight)} ${c.gray("· " + r.king.boosts + " boosts")}`);
+  if (!stones.length) {
+    console.log(c.gray("\n  no stones yet — place one with the Cairn Wallet, or:"));
+    console.log(c.green("  cairn propose --domain cairn:wall --title '<message>'"));
+    return;
+  }
+  const max = stones[0]?.weight || 1;
+  stones.slice(0, 25).forEach((s: any, i: number) => {
+    console.log("");
+    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))}  ${c.white(c.bold(s.message))}${i === 0 ? "  " + c.green("★") : ""}`);
+    console.log(`      ${bar(s.weight, max)}  ${csdFmt(s.weight)} ${c.gray("·")} ${c.green(String(s.boosts))} ${c.gray("boosts · " + age(s.ts) + " ago")}${(s.tags && s.tags.length) ? c.gray("  #" + s.tags.join(" #")) : ""}`);
+  });
+}
+
+async function cmdNetwork() {
+  const [n, s] = await Promise.all([api.apiNetwork(), api.apiStats().catch(() => null)]);
+  banner(); rule("network · compute substrate");
+  if (!n || !n.reachable) { console.log(err("node unreachable")); return; }
+  const row = (k: string, v: string) => console.log(`  ${kdim(pad(k, 15))} ${v}`);
+  const hr = (g: number) => (g >= 1000 ? (g / 1000).toFixed(2) + " TH/s" : (g ?? 0).toFixed(1) + " GH/s");
+  row("hashrate", `${c.white(hr(n.hashrateGHs))} ${c.gray("(1h " + hr(n.hashrate1h) + " · 24h " + hr(n.hashrate24h) + ")")}`);
+  row("block height", `${c.white(String(n.height))} ${c.gray("· last block " + age(n.lastBlockTime) + " ago")}`);
+  row("block time", `${c.white((n.avgBlockTimeSecs ?? 0).toFixed(0) + "s")} ${c.gray("(target " + n.targetBlockSecs + "s)")}`);
+  row("miners", `${c.white(String(n.minerCount))} ${c.gray("active ~24h")}`);
+  row("peers", `${c.white(String(n.peers))} ${c.gray("connected · " + n.knownPeers + " known · mempool " + n.mempoolTxCount)}`);
+  row("block reward", `${c.white(n.blockRewardCoins + " CSD")} ${c.gray("· " + Math.round(n.emittedSupplyCoins).toLocaleString() + " CSD emitted")}`);
+  row("chain age", c.white((n.chainAgeDays ?? 0).toFixed(1) + " days"));
+  row("activity", `${c.green(String(n.proposals))} proposals ${c.gray("·")} ${c.green(String(n.attestations))} attestations ${c.gray("· " + Number(n.transactions).toLocaleString() + " txs")}`);
+  if (s) row("board", `${c.green(String(s.items))} items ${c.gray("·")} ${c.green(String(s.supports))} supports ${c.gray("·")} ${c.green(String(s.participants))} participants ${c.gray("· " + s.totalSignalCoins + " CSD signal")}`);
+}
+
+async function cmdProfile(a: Args) {
+  const addr = a._[1];
+  if (!addr) { console.log(warn("usage: ") + c.cyan("cairn profile <addr>")); return; }
+  const r = await api.apiProfile(addr).catch(() => null);
+  if (!r || !r.ok) { console.log(err("no profile for " + addr)); return; }
+  const p = r.profile || {}, rep = r.reputation || {};
+  banner(); rule(`profile · ${p.handle || addr}`);
+  if (p.handle) console.log(`  ${kdim(pad("handle", 13))} ${c.white(p.handle)}`);
+  if (p.bio) console.log(`  ${kdim(pad("bio", 13))} ${c.gray(p.bio)}`);
+  if (p.github) console.log(`  ${kdim(pad("github", 13))} ${c.cyan(p.github)} ${p.githubVerified ? ok("verified") : c.gray("(unverified)")}`);
+  console.log(`  ${kdim(pad("address", 13))} ${c.gray(p.addr || addr)}`);
+  console.log(`  ${kdim(pad("trust", 13))} ${c.white((rep.trust ?? 0).toFixed(2))}`);
+  console.log(`  ${kdim(pad("work", 13))} ${c.green(String(rep.proposed ?? 0))} proposed ${c.gray("·")} ${c.green(String(rep.shipped ?? 0))} shipped ${c.gray("·")} ${c.green(String(rep.acceptedWork ?? 0))} accepted ${c.gray("·")} ${c.green(String(rep.reviews ?? 0))} reviews`);
+}
+
+async function cmdLeaderboard() {
+  const r = await api.apiLeaderboard();
+  banner(); rule("reputation leaderboard");
+  const lb = r.leaderboard ?? [];
+  if (!lb.length) { console.log(c.gray("  no ranked builders yet — reputation accrues from accepted quest work.")); return; }
+  lb.slice(0, 25).forEach((e: any, i: number) => {
+    console.log(`  ${c.magenta(c.bold(pad("#" + (i + 1), 4)))} ${c.white(pad(e.handle || e.addr, 26))} ${c.gray("trust")} ${c.white((e.trust ?? 0).toFixed(2))} ${c.gray("· " + (e.shipped ?? e.acceptedWork ?? 0) + " shipped · " + (e.proposed ?? 0) + " proposed")}`);
+  });
+}
+
+async function cmdQuests() {
+  const r = await api.apiQuests();
+  banner(); rule("quests");
+  const qs = r.quests ?? [];
+  if (!qs.length) { console.log(c.gray("  no open quests yet.")); return; }
+  qs.slice(0, 25).forEach((q: any, i: number) => {
+    const reward = q.quest?.reward?.build ? csdToCoins(q.quest.reward.build) + " CSD" : "—";
+    console.log("");
+    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))} ${c.white(c.bold(q.title))} ${c.gray("· " + (q.status || "?"))}`);
+    console.log(`      ${c.gray("reward " + reward + " · demand " + csdFmt(q.demandWeight || 0) + " · " + (q.demandSupporters || 0) + " backers")}`);
+    console.log(c.gray(`      id ${String(q.id).slice(0, 22)}…`));
+  });
+}
+
 async function help() {
   await bannerAnimated();
   const cmd = (n: string, args: string, d: string) => console.log(`  ${c.cyan(pad(n, 9))} ${c.gray(pad(args, 44))} ${c.dim(d)}`);
@@ -176,6 +250,11 @@ async function help() {
   cmd("recent", "", "recent proposals + support");
   cmd("show", "<id>", "item detail + integrity");
   cmd("verify", "<id>", "recompute hash, check vs chain");
+  cmd("wall", "", "the Wall — top stones + King");
+  cmd("network", "", "live network telemetry (alias: stats)");
+  cmd("quests", "", "open quests");
+  cmd("profile", "<addr>", "identity + reputation");
+  cmd("leaderboard", "", "top builders by reputation");
   cmd("propose", "--domain <d> --title <t> --body <b>", "post an item (needs CAIRN_TOKEN)");
   cmd("support", "<id> --fee <base>", "back an item (needs CAIRN_TOKEN)");
   console.log(c.gray("\n  lenses (--sort): " + Object.keys(LENS).join(" · ")));
@@ -194,6 +273,11 @@ async function main() {
     case "recent": return cmdRecent();
     case "show": return cmdShow(a);
     case "verify": return cmdVerify(a);
+    case "wall": return cmdWall();
+    case "network": case "stats": return cmdNetwork();
+    case "quests": return cmdQuests();
+    case "profile": return cmdProfile(a);
+    case "leaderboard": case "lb": return cmdLeaderboard();
     case "propose": return cmdPropose(a);
     case "support": return cmdSupport(a);
     default: return help();

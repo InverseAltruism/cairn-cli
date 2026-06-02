@@ -30,6 +30,11 @@ export const apiBoard = (domain: string, window: string) =>
   req(`/api/board?domain=${encodeURIComponent(domain)}&window=${encodeURIComponent(window)}`);
 export const apiItem = (id: string) => req(`/api/item/${encodeURIComponent(id)}`);
 export const apiActivity = () => req("/api/activity");
+export const apiWall = () => req("/api/wall");
+export const apiNetwork = () => req("/api/network");
+export const apiProfile = (addr: string) => req(`/api/profile/${encodeURIComponent(addr)}`);
+export const apiLeaderboard = () => req("/api/leaderboard");
+export const apiQuests = () => req("/api/quests");
 export const apiPropose = (body: { domain: string; title: string; body: string; links: string[]; fee: number }) =>
   writeReq("/api/propose", body);
 export const apiSupport = (body: { id: string; fee: number; score: number; confidence: number }) =>
