@@ -10,13 +10,13 @@ binary and no key files.
 ## Install
 
 ```bash
-npm install -g cairn-cli
+npm install -g @inversealtruism/cairn-cli
 ```
 
 Or run it without installing:
 
 ```bash
-npx cairn-cli ls
+npx @inversealtruism/cairn-cli ls
 ```
 
 Or build from source:

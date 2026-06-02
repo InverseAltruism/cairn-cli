@@ -1,11 +1,14 @@
 {
-  "name": "cairn-cli",
+  "name": "@inversealtruism/cairn-cli",
   "version": "0.1.0",
   "description": "Command-line client for a Cairn signal board on Compute Substrate — browse, propose, and back what to build.",
   "type": "module",
   "bin": { "cairn": "dist/cli.js" },
   "files": ["dist", "README.md"],
   "engines": { "node": ">=20" },
+  "repository": { "type": "git", "url": "git+https://github.com/InverseAltruism/cairn-cli.git" },
+  "homepage": "https://cairn-substrate.com",
+  "publishConfig": { "access": "public" },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
