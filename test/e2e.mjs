@@ -16,7 +16,7 @@ let pass = 0, fail = 0;
 const check = (n, c) => { c ? pass++ : fail++; console.log((c ? "  ✅ " : "  ❌ ") + n); };
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 function run(args, extraEnv = {}) {
-  const r = spawnSync("node", [CLI, ...args], { env: { ...process.env, CAIRN_API: API, NO_COLOR: "1", ...extraEnv }, encoding: "utf8", timeout: 20000 });
+  const r = spawnSync("node", [CLI, ...args], { env: { ...process.env, CAIRN_API: API, NO_COLOR: "1", CAIRN_CSD: "/nonexistent/csd", CAIRN_ADDR: "", CAIRN_CLI_CONFIG: "/nonexistent/cfg.json", ...extraEnv }, encoding: "utf8", timeout: 20000 });
   return { out: strip((r.stdout || "") + (r.stderr || "")), code: r.status };
 }
 
@@ -72,8 +72,10 @@ console.log("\n— error & edge paths —");
 check("show <bad id> → 'not found', no crash", /not found/.test(run(["show", "0xdeadbeef"]).out));
 check("verify with no id → usage hint", /usage/.test(run(["verify"]).out));
 check("unreachable API → friendly 'cannot reach' (no stack trace)", /cannot reach/i.test(run(["ls"], { CAIRN_API: "http://127.0.0.1:9" }).out));
-check("propose without a token → clear 'needs a token' error", /needs a token/i.test(run(["propose", "--domain", "csd:test", "--title", "x", "--body", "y"]).out));
-check("support without a token → clear 'needs a token' error", /needs a token/i.test(run(["support", "0xabc", "--fee", "5000000"]).out));
+check("propose without csd → guides to install/csd wallet", /csd|wallet/i.test(run(["propose", "--domain", "csd:test", "--title", "x", "--body", "y"]).out));
+check("support without csd → guides (or rejects bad id)", /csd|wallet|0x…64/i.test(run(["support", "0x"+"ab".repeat(32), "--fee", "0.05"]).out));
+check("help lists the wallet section (setup/send)", /setup/.test(run(["help"]).out) && /send/.test(run(["help"]).out));
+check("send without csd → guides", /csd|wallet/i.test(run(["send", "--to", "0x"+"cc".repeat(20), "--amount", "0.01"]).out));
 
 console.log("\n— write path (opt-in: CLI_E2E_WRITE=1) —");
 let token = process.env.CAIRN_TOKEN;

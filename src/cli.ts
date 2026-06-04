@@ -1,10 +1,43 @@
 #!/usr/bin/env node
 // cairn — command-line client for a Cairn signal board on Compute Substrate.
 // Reads are public; posting needs CAIRN_TOKEN. Config via env: CAIRN_API, CAIRN_TOKEN, CAIRN_RPC.
-import { CAIRN_API, MIN_FEE_PROPOSE, MIN_FEE_ATTEST, CSD_PER_COIN, csdToCoins } from "./lib/config.js";
+import { CAIRN_API, CAIRN_ADDR, CAIRN_TOKEN, MIN_FEE_PROPOSE, MIN_FEE_ATTEST, CSD_PER_COIN, csdToCoins, loadLocalConfig, saveLocalConfig } from "./lib/config.js";
 import * as api from "./lib/api.js";
+import * as csd from "./lib/csd.js";
 import { buildCommitment } from "./lib/item.js";
 import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, clearScreen } from "./lib/ui.js";
+
+const CSD = (n: number) => Number.isFinite(n) ? Math.round(n * CSD_PER_COIN) : NaN; // CSD → base units
+// Resolve the user's PUBLIC address (to fetch inputs from the proxy). Never reads the key
+// unless we must derive it locally from the user's own csd wallet config (then we cache
+// only the public address). Order: --address → CAIRN_ADDR → cached → derive via csd.
+async function resolveAddr(a: Args): Promise<string | null> {
+  const flag = a.flags.address ? String(a.flags.address) : (CAIRN_ADDR || loadLocalConfig().address);
+  if (flag && /^0x[0-9a-fA-F]{40}$/.test(flag)) return flag;
+  const cfg = await csd.walletConfig();
+  if (cfg?.default_privkey) { const addr = await csd.deriveAddr(cfg.default_privkey); if (addr) { saveLocalConfig({ address: addr }); return addr; } }
+  return null;
+}
+// Run a csd build/sign command (easy-path propose/attest/spend — they sign with the user's
+// wallet CONFIG key, so we pass no key) and submit the resulting signed tx through the Cairn
+// proxy ourselves. csd's own auto-submit posts to the wrong path for a proxy URL, so we don't
+// rely on it: if csd already submitted (http_ok), accept it; else we submit the signed `tx`.
+async function signAndSubmit(csdArgs: string[]): Promise<{ ok: boolean; txid?: string; error?: string }> {
+  const r = await csd.run(csdArgs);
+  if (!r.ok) return { ok: false, error: (r.stderr || r.stdout || "csd failed").trim().split("\n").slice(-1)[0] };
+  let out: any = null; try { out = JSON.parse(r.stdout); } catch { /* unexpected */ }
+  if (!out?.tx) return { ok: false, error: "csd produced no signed transaction" };
+  if (out.submit?.http_ok && out.txid) return { ok: true, txid: out.txid };
+  const sub = await api.submitTx(out.tx).catch((e: any) => ({ ok: false, err: e.message }));
+  return (sub.ok || sub.txid) ? { ok: true, txid: sub.txid || out.txid } : { ok: false, error: sub.err || "submit rejected by node", txid: out.txid };
+}
+// Guard: a write needs `csd` installed + a configured wallet (or an explicit --address + csd key).
+async function requireCsd(): Promise<boolean> {
+  if (!(await csd.available())) { console.log(err("`csd` not found.") + c.gray("  Install the Compute Substrate CLI, then ") + c.cyan("csd wallet new") + c.gray(" / ") + c.cyan("csd wallet init --privkey <key>") + c.gray(". Or set CAIRN_CSD to its path.")); return false; }
+  const cfg = await csd.walletConfig();
+  if (!cfg?.default_privkey) { console.log(err("no csd wallet key configured.") + c.gray("  Run ") + c.cyan("csd wallet new") + c.gray(" then ") + c.cyan("csd wallet init --privkey <key>") + c.gray(" — cairn signs with your csd wallet.")); return false; }
+  return true;
+}
 
 type Args = { _: string[]; flags: Record<string, string | boolean>; multi: Record<string, string[]> };
 function parse(argv: string[]): Args {
@@ -126,31 +159,126 @@ async function cmdVerify(a: Args) {
   }
 }
 
+// ── wallet (on top of the user's installed `csd` — cairn never holds the key) ──
+async function cmdSetup() {
+  banner(); rule("setup — cairn over your csd wallet");
+  const has = await csd.available();
+  console.log(`  ${kdim("csd binary")}  ${has ? ok("found (" + csd.CSD_BIN + ")") : err("not found — install Compute Substrate's csd CLI, or set CAIRN_CSD to its path")}`);
+  if (!has) { console.log(c.gray("\n  cairn signs nothing itself — it drives your csd wallet. Install csd, then re-run ") + c.cyan("cairn setup") + c.gray(".")); return; }
+  const cfg = await csd.walletConfig();
+  console.log(`  ${kdim("csd wallet")}  ${cfg?.default_privkey ? ok("key configured") : warn("no key — run ") + c.cyan("csd wallet new") + c.gray(" then ") + c.cyan("csd wallet init --privkey <key>")}`);
+  const addr = await resolveAddr(a0());
+  if (addr) {
+    console.log(`  ${kdim("address")}     ${c.cyan(addr)}`);
+    const b = await api.confirmedBalance(addr).catch(() => null);
+    if (b) console.log(`  ${kdim("balance")}     ${c.white(csdToCoins(b.balance))} CSD ${c.gray("(" + b.utxos + " utxos)")}`);
+  }
+  console.log(`  ${kdim("api")}         ${c.gray(CAIRN_API)}`);
+  if (has && cfg?.default_privkey) console.log(c.gray("\n  ready: ") + c.cyan("cairn send · cairn propose · cairn support · cairn wall place"));
+}
+const a0 = (): Args => ({ _: [], flags: {}, multi: {} });
+async function cmdAddress(a: Args) {
+  const addr = await resolveAddr(a);
+  if (!addr) { console.log(err("no address — run ") + c.cyan("cairn setup") + err(" (needs a configured csd wallet) or pass --address")); return; }
+  if (!isTty) { console.log(addr); return; }
+  banner(); rule("your address"); console.log(`  ${kdim("address")}  ${c.cyan(addr)}`);
+  const b = await api.confirmedBalance(addr).catch(() => null);
+  if (b) console.log(`  ${kdim("balance")}  ${c.white(csdToCoins(b.balance))} CSD ${c.gray("(" + b.utxos + " utxos)")}`);
+}
+async function cmdBalance(a: Args) { return cmdAddress(a); }
+
+function gatherOutputs(a: Args): { to: string; value: number }[] | string {
+  const outs: { to: string; value: number }[] = [];
+  for (const spec of (a.multi.output ?? [])) { const i = String(spec).lastIndexOf(":"); if (i < 0) return `bad --output (want <addr>:<CSD>): ${spec}`; outs.push({ to: String(spec).slice(0, i), value: CSD(Number(String(spec).slice(i + 1))) }); }
+  if (a.flags.to !== undefined || a.flags.amount !== undefined) outs.push({ to: String(a.flags.to ?? ""), value: CSD(Number(a.flags.amount ?? 0)) });
+  for (const o of outs) { if (!/^0x[0-9a-fA-F]{40}$/.test(o.to)) return `bad recipient: ${o.to}`; if (!(o.value > 0) || !Number.isSafeInteger(o.value)) return `bad amount for ${o.to}`; }
+  return outs.length ? outs : "no outputs";
+}
+async function cmdSend(a: Args) {
+  const outs = gatherOutputs(a);
+  if (typeof outs === "string") { console.log(outs === "no outputs" ? warn("usage: ") + c.cyan("cairn send --to <0x…40> --amount <CSD> [--fee <CSD>]") + c.gray("  (repeat --output <a>:<CSD> for many)") : err(outs)); return; }
+  if (!(await requireCsd())) return;
+  const addr = await resolveAddr(a); if (!addr) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
+  const feeCsd = a.flags.fee !== undefined ? Number(a.flags.fee) : 0.01;
+  const fee = (Number.isFinite(feeCsd) && feeCsd >= 0) ? CSD(feeCsd) : 1_000_000;
+  const total = outs.reduce((s, o) => s + o.value, 0);
+  console.log(`${kdim("from")}    ${c.cyan(addr)}`);
+  for (const o of outs) console.log(`${kdim("to")}      ${c.cyan(o.to)} ${c.gray("→ " + csdToCoins(o.value) + " CSD")}`);
+  console.log(`${kdim("fee")}     ${csdToCoins(fee)} CSD   ${kdim("total")} ${csdToCoins(total + fee)} CSD`);
+  if (a.flags["dry-run"]) { console.log(c.gray("\n[dry-run] not sent")); return; }
+  const sp = spinner("fetching input → csd signs → submit");
+  const input = await api.pickInput(addr, total + fee).catch(() => null);
+  if (!input) { sp.stop(); console.log(err("no single confirmed UTXO covers amount + fee") + c.gray(" — fund this address, or consolidate (a node + `csd … --auto-input` can combine inputs)")); return; }
+  const args = ["spend"]; for (const o of outs) args.push("--output", `${o.to}:${o.value}`);
+  args.push("--change", addr, "--fee", String(fee), "--input", input);
+  const r = await signAndSubmit(args); sp.stop();
+  console.log(r.ok ? ok(`sent  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)") : err(r.error || "failed"));
+}
+
 async function cmdPropose(a: Args) {
   const domain = String(a.flags.domain ?? "");
   const title = String(a.flags.title ?? "");
   const body = String(a.flags.body ?? "");
   const links = a.multi.link ?? [];
-  if (!domain || !title) { console.log(warn("usage: ") + c.cyan("cairn propose --domain csd:features --title <t> --body <b> [--link <url>] [--fee <base>]")); return; }
-  const fee = Number(a.flags.fee ?? MIN_FEE_PROPOSE);
-  const sp = spinner("posting to Cairn");
-  try {
-    const r = await api.apiPropose({ domain, title, body, links, fee: Number.isFinite(fee) && fee >= MIN_FEE_PROPOSE ? Math.floor(fee) : MIN_FEE_PROPOSE });
-    sp.stop();
-    console.log(r.ok ? ok(`proposed  ${c.cyan(r.id)}`) : err(r.error || "failed"));
-  } catch (e: any) { sp.stop(); console.log(err(e.message)); }
+  if (!domain || !title) { console.log(warn("usage: ") + c.cyan("cairn propose --domain csd:features --title <t> --body <b> [--link <url>] [--fee <CSD>] [--expires-days N]")); return; }
+  const feeCsd = a.flags.fee !== undefined ? Number(a.flags.fee) : 0.25;
+  const fee = Math.max(MIN_FEE_PROPOSE, Number.isFinite(feeCsd) ? CSD(feeCsd) : MIN_FEE_PROPOSE);
+  // operator-token path stays available for the instance operator
+  if (CAIRN_TOKEN && !(await csd.available())) {
+    const sp = spinner("posting via operator token");
+    try { const r = await api.apiPropose({ domain, title, body, links, fee }); sp.stop(); console.log(r.ok ? ok(`proposed  ${c.cyan(r.id)}`) + c.gray("  (operator)") : err(r.error || "failed")); } catch (e: any) { sp.stop(); console.log(err(e.message)); }
+    return;
+  }
+  if (!(await requireCsd())) return;
+  const addr = await resolveAddr(a); if (!addr) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
+  const content = { v: 1 as const, domain, title, body, links };
+  const { payloadHash } = buildCommitment(content);
+  const uri = "cairn:v1:" + payloadHash.slice(2, 14);
+  const sp = spinner("fetching input → csd signs → submit");
+  const input = await api.pickInput(addr, fee).catch(() => null);
+  if (!input) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
+  const tip = await api.tipHeight().catch(() => 0);
+  const days = Math.max(1, parseInt(String(a.flags["expires-days"] ?? 30)) || 30);
+  const r = await signAndSubmit(["propose", "--domain", domain, "--payload-hash", payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", input]);
+  sp.stop();
+  if (!r.ok) { console.log(err(r.error || "failed")); return; }
+  console.log(ok(`proposed  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
+  const sp2 = spinner("registering content (waits for the tx to mine)");
+  const done = await api.registerContent({ domain, title, body, links }, r.txid!);
+  sp2.stop();
+  console.log(done ? ok("content registered — visible on the board") : warn("content not registered yet — re-run once mined"));
 }
 
 async function cmdSupport(a: Args) {
   const id = a._[1];
-  if (!id) { console.log(warn("usage: ") + c.cyan("cairn support <id> --fee <base> [--score 0-100] [--confidence 0-100]")); return; }
-  const fee = Number(a.flags.fee ?? MIN_FEE_ATTEST);
-  const sp = spinner("posting support to Cairn");
-  try {
-    const r = await api.apiSupport({ id, fee: Number.isFinite(fee) && fee >= MIN_FEE_ATTEST ? Math.floor(fee) : MIN_FEE_ATTEST, score: Number(a.flags.score ?? 75), confidence: Number(a.flags.confidence ?? 60) });
-    sp.stop();
-    console.log(r.ok ? ok(`supported  ${c.cyan(r.id)}`) : err(r.error || "failed"));
-  } catch (e: any) { sp.stop(); console.log(err(e.message)); }
+  if (!id) { console.log(warn("usage: ") + c.cyan("cairn support <id> --fee <CSD> [--score 0-100] [--confidence 0-100]")); return; }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(id)) { console.log(err("proposal id must be 0x…64-hex")); return; }
+  const feeCsd = a.flags.fee !== undefined ? Number(a.flags.fee) : 0.05;
+  const fee = Math.max(MIN_FEE_ATTEST, Number.isFinite(feeCsd) ? CSD(feeCsd) : MIN_FEE_ATTEST);
+  const score = Math.max(0, Math.min(100, parseInt(String(a.flags.score ?? 75)) || 0));
+  const confidence = Math.max(0, Math.min(100, parseInt(String(a.flags.confidence ?? 60)) || 0));
+  if (CAIRN_TOKEN && !(await csd.available())) {
+    const sp = spinner("posting via operator token");
+    try { const r = await api.apiSupport({ id, fee, score, confidence }); sp.stop(); console.log(r.ok ? ok(`supported  ${c.cyan(r.id)}`) + c.gray("  (operator)") : err(r.error || "failed")); } catch (e: any) { sp.stop(); console.log(err(e.message)); }
+    return;
+  }
+  if (!(await requireCsd())) return;
+  const addr = await resolveAddr(a); if (!addr) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
+  const sp = spinner("fetching input → csd signs → submit");
+  const input = await api.pickInput(addr, fee).catch(() => null);
+  if (!input) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
+  const r = await signAndSubmit(["attest", "--proposal-id", id, "--score", String(score), "--confidence", String(confidence), "--fee", String(fee), "--change", addr, "--input", input]);
+  sp.stop();
+  console.log(r.ok ? ok(`supported  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)") : err(r.error || "failed"));
+}
+
+async function cmdWall(a: Args) {
+  if (a._[1] === "place") {
+    const msg = a._.slice(2).join(" ").trim() || String(a.flags.message ?? "").trim();
+    if (!msg) { console.log(warn("usage: ") + c.cyan('cairn wall place "<message>" [--fee <CSD>]')); return; }
+    return cmdPropose({ _: ["propose"], flags: { domain: "cairn:wall", title: msg, ...(a.flags.fee !== undefined ? { fee: a.flags.fee } : {}) }, multi: {} });
+  }
+  return cmdWallView();
 }
 
 async function cmdDomains() {
@@ -165,7 +293,7 @@ async function cmdDomains() {
   }
 }
 
-async function cmdWall() {
+async function cmdWallView() {
   const r = await api.apiWall();
   const stones = r.stones ?? [];
   banner(); rule(`the wall · ${r.totals?.stones ?? 0} stones · ${r.totals?.boosts ?? 0} boosts · epoch ${r.epoch ?? "?"}`);
@@ -255,13 +383,19 @@ async function help() {
   cmd("quests", "", "open quests");
   cmd("profile", "<addr>", "identity + reputation");
   cmd("leaderboard", "", "top builders by reputation");
-  cmd("propose", "--domain <d> --title <t> --body <b>", "post an item (needs CAIRN_TOKEN)");
-  cmd("support", "<id> --fee <base>", "back an item (needs CAIRN_TOKEN)");
+  cmd("wall place", '"<message>"', "place a stone on the Wall (a cairn:wall proposal)");
+  console.log("");
+  console.log(c.bold("  wallet") + c.gray("  (signs with your installed csd wallet — cairn never holds your key)"));
+  cmd("setup", "", "check csd + wallet, show your address (alias: doctor)");
+  cmd("address", "", "your address + balance (alias: whoami, balance)");
+  cmd("send", "--to <0x…40> --amount <CSD>", "transfer CSD (+ --output <a>:<CSD> ×N, --fee <CSD>, --dry-run)");
+  cmd("propose", "--domain <d> --title <t> --body <b>", "post an item (alias: post; + --fee <CSD>, --expires-days)");
+  cmd("support", "<id> --fee <CSD>", "back an item (+ --score, --confidence)");
   console.log(c.gray("\n  lenses (--sort): " + Object.keys(LENS).join(" · ")));
-  console.log(c.gray(`  api: ${CAIRN_API}  ·  1 CSD = ${CSD_PER_COIN} base · propose ≥ ${MIN_FEE_PROPOSE} · attest ≥ ${MIN_FEE_ATTEST}`));
-  console.log(c.gray("  config: CAIRN_API (board url) · CAIRN_TOKEN (instance write token, to post) · CAIRN_RPC (trustless verify)"));
+  console.log(c.gray(`  api: ${CAIRN_API}  ·  1 CSD = ${CSD_PER_COIN} base · propose ≥ ${csdToCoins(MIN_FEE_PROPOSE)} · attest ≥ ${csdToCoins(MIN_FEE_ATTEST)} CSD`));
+  console.log(c.gray("  config: CAIRN_API (board) · CAIRN_CSD (csd binary) · CAIRN_ADDR (your addr) · CAIRN_RPC (trustless verify) · CAIRN_TOKEN (operator)"));
   console.log(c.gray("  display: honors NO_COLOR · --no-color · --no-anim · TERM=dumb (color/animation auto-off when piped)"));
-  console.log(c.gray("  keyless non-custodial posting + sealed claims: use the Cairn Wallet (browser extension)."));
+  console.log(c.gray("  writes are signed by your own ") + c.cyan("csd") + c.gray(" wallet (csd wallet new / init); cairn supplies the input + Cairn content. Sealed claims + Sign-in: use the Cairn Wallet."));
 }
 
 async function main() {
@@ -273,12 +407,16 @@ async function main() {
     case "recent": return cmdRecent();
     case "show": return cmdShow(a);
     case "verify": return cmdVerify(a);
-    case "wall": return cmdWall();
+    case "wall": return cmdWall(a);
     case "network": case "stats": return cmdNetwork();
     case "quests": return cmdQuests();
     case "profile": return cmdProfile(a);
     case "leaderboard": case "lb": return cmdLeaderboard();
-    case "propose": return cmdPropose(a);
+    case "setup": case "doctor": return cmdSetup();
+    case "address": case "whoami": return cmdAddress(a);
+    case "balance": return cmdBalance(a);
+    case "send": return cmdSend(a);
+    case "propose": case "post": return cmdPropose(a);
     case "support": return cmdSupport(a);
     default: return help();
   }

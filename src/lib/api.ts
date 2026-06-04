@@ -40,6 +40,36 @@ export const apiPropose = (body: { domain: string; title: string; body: string; 
 export const apiSupport = (body: { id: string; fee: number; score: number; confidence: number }) =>
   writeReq("/api/support", body);
 
+// ── proxy bridge: lets a node-less user transact via `csd`. We fetch a spendable input
+//    + the chain tip from the Cairn instance's public /api/rpc/* proxy, hand the input to
+//    `csd … --input`, and submit through `--rpc-url <CAIRN_API>/api/rpc`. ──
+export const rpcBase = () => `${CAIRN_API}/api/rpc`;
+// One confirmed, mature, non-coinbase UTXO worth > minValue (smallest sufficient) for addr,
+// as the csd input triple "<txid>:<vout>:<value>" — or null.
+export async function pickInput(addr: string, minValue: number): Promise<string | null> {
+  const j = await req(`/api/rpc/utxos-all/${encodeURIComponent(addr)}`);
+  const ok = (x: any) => Number(x.confirmations ?? 0) >= 1 && Number.isSafeInteger(Number(x.value)) && Number(x.value) > minValue && !x.coinbase;
+  const cand = (j.utxos ?? []).filter(ok).sort((a: any, b: any) => Number(a.value) - Number(b.value));
+  const x = cand[0] ?? (j.utxos ?? []).find(ok);
+  return x ? `${x.txid}:${Number(x.vout)}:${Number(x.value)}` : null;
+}
+export async function confirmedBalance(addr: string): Promise<{ balance: number; utxos: number }> {
+  const j = await req(`/api/rpc/utxos-all/${encodeURIComponent(addr)}`);
+  return { balance: Number(j.confirmed_balance ?? 0), utxos: (j.utxos ?? []).length };
+}
+export async function tipHeight(): Promise<number> { return Number((await req("/api/rpc/tip")).height ?? 0); }
+// Submit a node-JSON tx through the proxy (for `csd spend`, which builds+signs but doesn't
+// reliably submit to a proxy URL). Returns the node's response.
+export async function submitTx(txNodeJson: unknown): Promise<any> { return req("/api/rpc/tx/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx: txNodeJson }) }); }
+// Register a proposal's off-chain content (self-certifying; accepted once mined + hash-matched).
+export async function registerContent(content: any, txid: string, attempts = 20): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    try { const r = await req("/api/content", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...content, txid }) }); if (r.ok) return true; } catch { /* keep trying while it mines */ }
+    await new Promise((res) => setTimeout(res, 8000));
+  }
+  return false;
+}
+
 // optional: query a raw csd node RPC (for trustless verify)
 export async function chainProposal(id: string): Promise<any | null> {
   if (!CAIRN_RPC) return null;

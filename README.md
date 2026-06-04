@@ -1,11 +1,14 @@
 # cairn-cli
 
-A command-line client for a Cairn signal board on Compute Substrate. Browse what the community is
-backing, and with a token, propose or support items, all from your terminal.
+A command-line client for **Compute Substrate / Cairn** — browse the board, and **send CSD,
+propose, attest, and place stones on the Wall** straight from your terminal.
 
-Cairn is a fee-weighted "paid attention" board: people spend CSD to surface what should be built,
-fixed, or funded. `cairn-cli` is a thin HTTP client for a Cairn instance. Browsing needs no `csd`
-binary and no key files.
+For the people who'd rather not put a key in a browser extension: **cairn-cli never holds your
+key.** Reads are plain HTTP. For writes it drives your **own installed `csd` wallet** — `csd`
+signs with your key (CSD_SIG_V1), and cairn-cli adds the Cairn layer on top: it computes the
+canonical payload hash, fetches a spendable input from the Cairn proxy (so you don't need a
+synced local node), registers your off-chain content, and gives you the board / wall / network
+views the raw `csd` CLI doesn't have. Browsing needs no `csd` binary and no keys.
 
 ## Install
 
@@ -49,32 +52,48 @@ cairn leaderboard            # top builders by reputation
 cairn ls --json              # machine-readable output
 ```
 
-Posting needs a token from the board operator:
+## Wallet (transacting — uses your own `csd` wallet)
+
+One-time: install Compute Substrate's `csd` CLI and create/import your key.
 
 ```bash
-export CAIRN_TOKEN=…         # the instance's write token
-cairn propose --domain csd:features --title "Wallet GUI" --body "A graphical wallet…" --link https://…
-cairn support <id> --fee 5000000 --score 90 --confidence 80
+csd wallet new                          # or: csd wallet init --privkey <your key>
+cairn setup                             # checks csd + wallet, shows your address + balance
 ```
+
+Then transact — cairn-cli builds the request, `csd` signs with your key, and the tx is submitted
+through the Cairn proxy (no local node required):
+
+```bash
+cairn address                           # your address + balance (alias: whoami, balance)
+cairn send --to 0x… --amount 1.5        # transfer CSD (--output 0x…:0.5 ×N for many, --fee <CSD>)
+cairn propose --domain csd:features --title "Wallet GUI" --body "…" --link https://…
+cairn support <id> --fee 0.1 --score 90 --confidence 80
+cairn wall place "gm, Compute Substrate"
+```
+
+Fees and amounts are in **CSD** (e.g. `--amount 1.5`, `--fee 0.05`). Minimums: 0.25 CSD to propose,
+0.05 CSD to attest. Support is a paid demand signal, not a payment to the author; fees go to miners.
 
 ## Configuration (environment variables)
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CAIRN_API` | `https://cairn-substrate.com` | the board to talk to (use your own, e.g. `http://127.0.0.1:7777`) |
-| `CAIRN_TOKEN` | – | required only to post (propose or support) |
-| `CAIRN_RPC` | – | optional csd node RPC; enables fully trustless `verify` by recomputing the hash and confirming the one on-chain |
+| `CAIRN_API` | `https://cairn-substrate.com` | the board / proxy to talk to (use your own, e.g. `http://127.0.0.1:7777`) |
+| `CAIRN_CSD` | `csd` | path to your installed `csd` binary (signs your transactions) |
+| `CAIRN_ADDR` | – | your public addr20; skips deriving it from the csd wallet |
+| `CAIRN_RPC` | – | optional csd node RPC; enables fully trustless `verify` (recompute the hash + confirm on-chain) |
+| `CAIRN_TOKEN` | – | board-operator write token (operator convenience; normal users sign with `csd` instead) |
 
 ## How it works
 
-- `browse`, `show`, `recent`, and `watch` read the board's public API.
+- `browse`, `show`, `recent`, `watch`, `wall`, `network`, `quests` read the board's public API.
 - `verify` fetches an item, recomputes `sha256(canonical content)` locally, and if `CAIRN_RPC` is set,
   confirms that hash is the one committed on-chain. You trust the math, not the server.
-- `propose` and `support` post through the instance, which records the item and submits the on-chain
-  proposal or attestation. Fees go to miners. Support is a paid demand signal, not a payment to the
-  author.
-
-Fees are in base units (1 CSD = 1e8). Minimums are 0.25 CSD to propose and 0.05 CSD to attest.
+- `send` / `propose` / `support` / `wall place`: cairn-cli fetches a spendable input from the Cairn
+  proxy, hands it to **your** `csd` (which signs with your wallet key — the key never leaves your
+  machine and never touches cairn-cli), then submits the signed transaction through the proxy and (for
+  proposals) registers the off-chain content. Sealed claims and Sign-in-with-CSD live in the Cairn Wallet.
 
 ## License
 

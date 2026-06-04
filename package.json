@@ -1,21 +1,37 @@
 {
   "name": "@inversealtruism/cairn-cli",
-  "version": "0.2.0",
-  "description": "Command-line client for a Cairn signal board on Compute Substrate — browse, propose, and back what to build.",
+  "version": "0.3.0",
+  "description": "CLI for Compute Substrate / Cairn \u2014 browse the board/wall/network, and send CSD, propose, attest, and place stones non-custodially by driving your own installed `csd` wallet (cairn never holds your key; works node-less via the Cairn proxy).",
   "type": "module",
-  "bin": { "cairn": "dist/cli.js" },
-  "files": ["dist", "README.md"],
-  "engines": { "node": ">=20" },
-  "repository": { "type": "git", "url": "git+https://github.com/InverseAltruism/cairn-cli.git" },
+  "bin": {
+    "cairn": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/InverseAltruism/cairn-cli.git"
+  },
   "homepage": "https://cairn-substrate.com",
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
     "test": "tsc && node test/e2e.mjs",
     "prepare": "tsc"
   },
-  "keywords": ["cairn", "compute-substrate", "cli"],
+  "keywords": [
+    "cairn",
+    "compute-substrate",
+    "cli"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.10.0",
