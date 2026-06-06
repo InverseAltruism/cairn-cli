@@ -18,6 +18,10 @@ function writeReq(path: string, body: unknown): Promise<any> {
   if (!CAIRN_TOKEN) throw new Error("posting needs a token — set CAIRN_TOKEN (the operator's write token)");
   return req(path, {
     method: "POST",
+    // never follow a redirect on a write: undici keeps custom headers across cross-origin
+    // 30x, so a hostile/MITM'd CAIRN_API could otherwise bounce the x-cairn-token to an
+    // attacker host. Fail closed instead.
+    redirect: "error",
     headers: { "content-type": "application/json", "x-cairn-token": CAIRN_TOKEN },
     body: JSON.stringify(body),
   });
@@ -46,12 +50,24 @@ export const apiSupport = (body: { id: string; fee: number; score: number; confi
 export const rpcBase = () => `${CAIRN_API}/api/rpc`;
 // One confirmed, mature, non-coinbase UTXO worth > minValue (smallest sufficient) for addr,
 // as the csd input triple "<txid>:<vout>:<value>" — or null.
-export async function pickInput(addr: string, minValue: number): Promise<string | null> {
+// One confirmed, mature, non-coinbase UTXO worth > minValue (smallest sufficient) for addr.
+// Returns { input: "<txid>:<vout>:<value>", value } — value is the proxy-reported amount the
+// caller surfaces so the user sees the true implied fee (a hostile proxy under-reporting it
+// only inflates the fee it burns to the miner; it can never redirect funds — change goes to
+// the user's own --change addr). txid/vout are format-validated so a malformed value can't
+// produce a junk (rejected) tx.
+const HEX64 = /^0x?[0-9a-fA-F]{64}$/;
+export async function pickInput(addr: string, minValue: number): Promise<{ input: string; value: number } | null> {
   const j = await req(`/api/rpc/utxos-all/${encodeURIComponent(addr)}`);
-  const ok = (x: any) => Number(x.confirmations ?? 0) >= 1 && Number.isSafeInteger(Number(x.value)) && Number(x.value) > minValue && !x.coinbase;
+  const ok = (x: any) =>
+    Number(x.confirmations ?? 0) >= 1 &&
+    Number.isSafeInteger(Number(x.value)) && Number(x.value) > minValue &&
+    Number.isInteger(Number(x.vout)) && Number(x.vout) >= 0 &&
+    typeof x.txid === "string" && HEX64.test(x.txid) &&
+    !x.coinbase;
   const cand = (j.utxos ?? []).filter(ok).sort((a: any, b: any) => Number(a.value) - Number(b.value));
   const x = cand[0] ?? (j.utxos ?? []).find(ok);
-  return x ? `${x.txid}:${Number(x.vout)}:${Number(x.value)}` : null;
+  return x ? { input: `${x.txid}:${Number(x.vout)}:${Number(x.value)}`, value: Number(x.value) } : null;
 }
 export async function confirmedBalance(addr: string): Promise<{ balance: number; utxos: number }> {
   const j = await req(`/api/rpc/utxos-all/${encodeURIComponent(addr)}`);
@@ -73,8 +89,9 @@ export async function registerContent(content: any, txid: string, attempts = 20)
 // optional: query a raw csd node RPC (for trustless verify)
 export async function chainProposal(id: string): Promise<any | null> {
   if (!CAIRN_RPC) return null;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(id)) return null; // never splice an unshaped id into the URL
   try {
-    const r = await fetch(`${CAIRN_RPC}/proposal/${id}`, { signal: AbortSignal.timeout(6000) });
+    const r = await fetch(`${CAIRN_RPC}/proposal/${encodeURIComponent(id)}`, { redirect: "error", signal: AbortSignal.timeout(6000) });
     if (!r.ok) return null;
     const j = await r.json();
     return j.proposal ?? j ?? null;

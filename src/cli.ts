@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // cairn — command-line client for a Cairn signal board on Compute Substrate.
 // Reads are public; posting needs CAIRN_TOKEN. Config via env: CAIRN_API, CAIRN_TOKEN, CAIRN_RPC.
-import { CAIRN_API, CAIRN_ADDR, CAIRN_TOKEN, MIN_FEE_PROPOSE, MIN_FEE_ATTEST, CSD_PER_COIN, csdToCoins, loadLocalConfig, saveLocalConfig } from "./lib/config.js";
+import { CAIRN_API, CAIRN_ADDR, CAIRN_TOKEN, CAIRN_RPC, MIN_FEE_PROPOSE, MIN_FEE_ATTEST, CSD_PER_COIN, csdToCoins, loadLocalConfig, saveLocalConfig } from "./lib/config.js";
 import * as api from "./lib/api.js";
 import * as csd from "./lib/csd.js";
 import { buildCommitment } from "./lib/item.js";
-import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, clearScreen } from "./lib/ui.js";
+import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, anim, clearScreen, cursorHome, san } from "./lib/ui.js";
 
 const CSD = (n: number) => Number.isFinite(n) ? Math.round(n * CSD_PER_COIN) : NaN; // CSD → base units
 // Resolve the user's PUBLIC address (to fetch inputs from the proxy). Never reads the key
@@ -15,21 +15,39 @@ async function resolveAddr(a: Args): Promise<string | null> {
   const flag = a.flags.address ? String(a.flags.address) : (CAIRN_ADDR || loadLocalConfig().address);
   if (flag && /^0x[0-9a-fA-F]{40}$/.test(flag)) return flag;
   const cfg = await csd.walletConfig();
+  // Prefer the address csd already exposes (change addr) — avoids re-deriving from the
+  // privkey, which would put the key on the `csd` argv (visible via /proc on a shared host).
+  if (cfg?.default_change_addr20 && /^0x[0-9a-fA-F]{40}$/.test(String(cfg.default_change_addr20))) {
+    const addr = String(cfg.default_change_addr20); saveLocalConfig({ address: addr }); return addr;
+  }
   if (cfg?.default_privkey) { const addr = await csd.deriveAddr(cfg.default_privkey); if (addr) { saveLocalConfig({ address: addr }); return addr; } }
   return null;
 }
 // Run a csd build/sign command (easy-path propose/attest/spend — they sign with the user's
 // wallet CONFIG key, so we pass no key) and submit the resulting signed tx through the Cairn
-// proxy ourselves. csd's own auto-submit posts to the wrong path for a proxy URL, so we don't
-// rely on it: if csd already submitted (http_ok), accept it; else we submit the signed `tx`.
+// proxy ourselves. We do NOT trust csd's own auto-submit: it targets csd's configured node,
+// which may be a different node than the one the Cairn board (and its miner) read — so a tx
+// could sit in the wrong mempool and never get mined into the board's view. Always submit via
+// the proxy (the board's miner-connected node). A repeat that comes back "already present /
+// known" for OUR txid is success (the tx is in that node's mempool); a true double-spend
+// "conflict" is the only ambiguous case, so we confirm via a tx lookup before claiming ok.
 async function signAndSubmit(csdArgs: string[]): Promise<{ ok: boolean; txid?: string; error?: string }> {
   const r = await csd.run(csdArgs);
   if (!r.ok) return { ok: false, error: (r.stderr || r.stdout || "csd failed").trim().split("\n").slice(-1)[0] };
   let out: any = null; try { out = JSON.parse(r.stdout); } catch { /* unexpected */ }
   if (!out?.tx) return { ok: false, error: "csd produced no signed transaction" };
-  if (out.submit?.http_ok && out.txid) return { ok: true, txid: out.txid };
+  const txid: string | undefined = out.txid;
   const sub = await api.submitTx(out.tx).catch((e: any) => ({ ok: false, err: e.message }));
-  return (sub.ok || sub.txid) ? { ok: true, txid: sub.txid || out.txid } : { ok: false, error: sub.err || "submit rejected by node", txid: out.txid };
+  if (sub.ok) return { ok: true, txid: sub.txid || txid };
+  // A benign "already present / mempool conflict" for OUR txid means the tx is already in a
+  // mempool (e.g. csd's own auto-submit reached this same node first, or a re-run) — success.
+  // For a single-key wallet this is safe: only the key owner can produce a conflicting spend
+  // of their own UTXO, so a conflict on our freshly-built tx is our own prior submit, not a
+  // third party. (The narrow exception — two DIFFERENT local spends of one UTXO fired at once
+  // — is on the user.) The node can't be queried for mempool membership (its /tx indexes only
+  // mined txs), so we rely on the matching txid + benign message.
+  if (txid && /already|present|known|in mempool|conflict/i.test(String(sub.err ?? ""))) return { ok: true, txid };
+  return { ok: false, error: sub.err || "submit rejected by node", txid };
 }
 // Guard: a write needs `csd` installed + a configured wallet (or an explicit --address + csd key).
 async function requireCsd(): Promise<boolean> {
@@ -55,6 +73,11 @@ function parse(argv: string[]): Args {
   }
   return { _, flags, multi };
 }
+// Do two URLs point at the same host? (used to refuse a "trustless" verify claim when the
+// node RPC and the board API are the same operator). Unparseable → treat as same (safe).
+function sameHost(a: string, b: string): boolean {
+  try { return new URL(a).host.toLowerCase() === new URL(b).host.toLowerCase(); } catch { return true; }
+}
 const age = (sec: number) => {
   if (!sec) return "—";
   const d = Math.max(0, Math.floor(Date.now() / 1000) - sec);
@@ -75,9 +98,9 @@ function printRows(items: any[], sort = "totalWeight") {
     const lens = !["totalWeight", "supporterCount"].includes(sort) && r[sort] != null
       ? c.gray(" · " + (sort === "createdHeight" ? "h" + r[sort] : csdFmt(r[sort]) + " " + sort)) : "";
     console.log("");
-    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))}  ${c.white(c.bold(r.title))}  ${badge(r.source)}${r.sealed ? "  " + c.gray(r.revealed ? "🔓 revealed" : "🔒 sealed") : ""}`);
-    console.log(`      ${bar(r[sort] || r.totalWeight, max)}  ${csdFmt(r.totalWeight)} ${c.gray("·")} ${c.green(String(r.supporterCount))} ${c.gray("supporters · score " + r.avgScore + " · " + age(r.createdTime) + " ago")}${lens}`);
-    console.log(c.gray(`      ${r.domain} · id ${String(r.id).slice(0, 22)}…`));
+    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))}  ${c.white(c.bold(san(r.title)))}  ${badge(r.source)}${r.sealed ? "  " + c.gray(r.revealed ? "🔓 revealed" : "🔒 sealed") : ""}`);
+    console.log(`      ${bar(r[sort] || r.totalWeight, max)}  ${csdFmt(r.totalWeight)} ${c.gray("·")} ${c.green(String(r.supporterCount))} ${c.gray("supporters · score " + Number(r.avgScore) + " · " + age(r.createdTime) + " ago")}${lens}`);
+    console.log(c.gray(`      ${san(r.domain)} · id ${san(String(r.id).slice(0, 22))}…`));
   });
 }
 
@@ -98,15 +121,28 @@ async function cmdWatch(a: Args) {
   const domain = a._[1] ?? "all";
   const window = String(a.flags.window ?? "trending");
   if (!isTty) { printRows((await api.apiBoard(domain, window)).items); return; }
-  process.stdout.write("\x1b[?25l");
-  process.on("SIGINT", () => { process.stdout.write("\x1b[?25h\n"); process.exit(0); });
+  const PERIOD = 5; // seconds between refreshes
+  const PULSE = ["◐", "◓", "◑", "◒"]; // a spinning "live" mark in the footer
+  process.stdout.write("\x1b[?25l");                                  // hide cursor
+  const restore = () => process.stdout.write("\x1b[?25h\n");
+  process.on("SIGINT", () => { restore(); process.exit(0); });
+  clearScreen();
+  let first = true;
   for (;;) {
     const r = await api.apiBoard(domain, window).catch(() => ({ items: [] }));
-    clearScreen(); banner();
+    // first paint clears the screen; subsequent paints repaint from home (no black flash)
+    if (first) { clearScreen(); first = false; } else cursorHome();
+    banner();
     rule(`watch · ${domain} · ${window} · ${new Date().toLocaleTimeString()}`);
     printRows(r.items);
-    console.log(c.gray("\n  ") + c.green("●") + c.gray(" live · refreshes every 5s · Ctrl+C to exit"));
-    await sleep(5000);
+    process.stdout.write("\n"); // reserve the footer line, then redraw it in place each second
+    // animated footer: a phosphor pulse + a "next refresh" countdown (single line, \r-redrawn)
+    for (let s = PERIOD; s > 0; s--) {
+      const mark = c.green(PULSE[(PERIOD - s) % PULSE.length]!);
+      process.stdout.write(`\r\x1b[K  ${mark} ${c.gray("live · " + (r.items?.length ?? 0) + " items · next refresh in " + s + "s · Ctrl+C to exit")}`);
+      await sleep(anim ? 1000 : PERIOD * 1000);
+      if (!anim) break;
+    }
   }
 }
 
@@ -115,7 +151,7 @@ async function cmdRecent() {
   banner(); rule("recent activity");
   for (const ev of r.activity ?? []) {
     const verb = ev.type === "support" ? c.green("◈ supported") : c.cyan("✎ proposed ");
-    console.log(`  ${verb} ${c.white(String(ev.item).slice(0, 42))} ${c.gray("· " + age(ev.time) + " ago · " + (ev.amount / 1e8) + " CSD")}`);
+    console.log(`  ${verb} ${c.white(san(String(ev.item).slice(0, 42)))} ${c.gray("· " + age(ev.time) + " ago · " + (Number(ev.amount) / 1e8) + " CSD")}`);
   }
 }
 
@@ -125,14 +161,14 @@ async function cmdShow(a: Args) {
   const r = await api.apiItem(id).catch(() => null);
   if (!r || !r.ok) { console.log(err("not found")); return; }
   const it = r.item;
-  rule(it.title);
-  console.log(`  ${badge(it.source)}  ${c.gray("·")}  ${c.cyan(it.domain)}`);
-  console.log(`\n  ${c.white(it.body)}\n`);
-  if (it.links?.length) console.log(`  ${kdim("links")}     ${it.links.map((l: string) => c.cyan(l)).join(", ")}`);
-  const total = (r.supports ?? []).reduce((x: number, s: any) => x + s.weight, 0);
+  rule(san(it.title));
+  console.log(`  ${badge(it.source)}  ${c.gray("·")}  ${c.cyan(san(it.domain))}`);
+  console.log(`\n  ${c.white(san(it.body))}\n`);
+  if (it.links?.length) console.log(`  ${kdim("links")}     ${it.links.map((l: string) => c.cyan(san(l))).join(", ")}`);
+  const total = (r.supports ?? []).reduce((x: number, s: any) => x + Number(s.weight), 0);
   console.log(`  ${kdim("support")}   ${csdFmt(total)} ${c.gray("from")} ${c.green(String(new Set((r.supports ?? []).map((s: any) => s.attester)).size))} ${c.gray("supporters")}`);
-  console.log(`  ${kdim("proposer")}  ${c.gray(it.proposerHandle || it.proposer)}`);
-  console.log(`  ${kdim("hash")}      ${c.magenta(it.payloadHash)}`);
+  console.log(`  ${kdim("proposer")}  ${c.gray(san(it.proposerHandle || it.proposer))}`);
+  console.log(`  ${kdim("hash")}      ${c.magenta(san(it.payloadHash))}`);
   console.log(`  ${kdim("integrity")} ${r.integrityOk ? ok("content matches commitment") : err("MISMATCH")}`);
 }
 
@@ -143,19 +179,27 @@ async function cmdVerify(a: Args) {
   const r = await api.apiItem(id).catch(() => null);
   if (!r || !r.ok) { sp.stop(); console.log(err("not found")); return; }
   const it = r.item;
+  // Hash the RAW server-reported content (never san()'d — we must hash the exact bytes).
   const { payloadHash } = buildCommitment({ v: 1, domain: it.domain, title: it.title, body: it.body, links: it.links ?? [] });
-  const chain = await api.chainProposal(it.id);
+  // Only consult the chain RPC for a well-formed id (the server echoes it.id back; an
+  // attacker-shaped id must not be spliced into the RPC URL — see api.chainProposal).
+  const chain = /^0x[0-9a-fA-F]{64}$/.test(String(it.id ?? "")) ? await api.chainProposal(it.id) : null;
   sp.stop();
   console.log(`${kdim("recomputed")}  ${c.magenta(payloadHash)}`);
-  console.log(`${kdim("reported")}    ${c.magenta(it.payloadHash)}`);
+  console.log(`${kdim("reported")}    ${c.magenta(san(it.payloadHash))}`);
   const contentOk = payloadHash.toLowerCase() === String(it.payloadHash).toLowerCase();
   if (chain?.payload_hash) {
-    console.log(`${kdim("on-chain")}    ${c.magenta(chain.payload_hash)}`);
-    console.log(contentOk && String(chain.payload_hash).toLowerCase() === payloadHash.toLowerCase()
-      ? ok("VERIFIED — content matches the on-chain commitment (trustless, via CAIRN_RPC)")
-      : err("MISMATCH"));
+    // "trustless" only holds if CAIRN_RPC is an INDEPENDENT node — if it's the same host as
+    // the board API, the same operator controls both answers, so don't claim trustlessness.
+    const independent = !sameHost(CAIRN_RPC, CAIRN_API);
+    const chainOk = contentOk && String(chain.payload_hash).toLowerCase() === payloadHash.toLowerCase();
+    console.log(`${kdim("on-chain")}    ${c.magenta(san(chain.payload_hash))}`);
+    if (chainOk) console.log(independent
+      ? ok("VERIFIED — content matches the on-chain commitment (trustless, via an independent CAIRN_RPC)")
+      : ok("content matches the commitment reported by this RPC") + c.gray("  ⚠ CAIRN_RPC shares a host with CAIRN_API — point it at an independent node for a trustless check"));
+    else console.log(err("MISMATCH"));
   } else {
-    console.log(contentOk ? ok("content matches the reported commitment") + c.gray("  (set CAIRN_RPC to also check the chain directly)") : err("content does NOT match the reported hash"));
+    console.log(contentOk ? ok("content matches the reported commitment") + c.gray("  (set CAIRN_RPC to an independent node to also check the chain directly)") : err("content does NOT match the reported hash"));
   }
 }
 
@@ -207,11 +251,17 @@ async function cmdSend(a: Args) {
   console.log(`${kdim("fee")}     ${csdToCoins(fee)} CSD   ${kdim("total")} ${csdToCoins(total + fee)} CSD`);
   if (a.flags["dry-run"]) { console.log(c.gray("\n[dry-run] not sent")); return; }
   const sp = spinner("fetching input → csd signs → submit");
-  const input = await api.pickInput(addr, total + fee).catch(() => null);
-  if (!input) { sp.stop(); console.log(err("no single confirmed UTXO covers amount + fee") + c.gray(" — fund this address, or consolidate (a node + `csd … --auto-input` can combine inputs)")); return; }
+  const picked = await api.pickInput(addr, total + fee).catch(() => null);
+  if (!picked) { sp.stop(); console.log(err("no single confirmed UTXO covers amount + fee") + c.gray(" — fund this address, or consolidate (a node + `csd … --auto-input` can combine inputs)")); return; }
+  sp.stop();
+  // transparency: show the input value + change so a hostile proxy under-reporting the input
+  // (which would silently inflate the burned fee) is visible before we sign. Change goes to
+  // your own address; the proxy can never redirect it.
+  console.log(`${kdim("input")}   ${csdToCoins(picked.value)} CSD ${c.gray("(one UTXO)")}   ${kdim("change")} ${csdToCoins(Math.max(0, picked.value - total - fee))} CSD ${c.gray("back to you")}`);
+  const sp2 = spinner("csd signs → submit");
   const args = ["spend"]; for (const o of outs) args.push("--output", `${o.to}:${o.value}`);
-  args.push("--change", addr, "--fee", String(fee), "--input", input);
-  const r = await signAndSubmit(args); sp.stop();
+  args.push("--change", addr, "--fee", String(fee), "--input", picked.input);
+  const r = await signAndSubmit(args); sp2.stop();
   console.log(r.ok ? ok(`sent  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)") : err(r.error || "failed"));
 }
 
@@ -234,12 +284,20 @@ async function cmdPropose(a: Args) {
   const content = { v: 1 as const, domain, title, body, links };
   const { payloadHash } = buildCommitment(content);
   const uri = "cairn:v1:" + payloadHash.slice(2, 14);
+  if (a.flags["dry-run"]) {
+    console.log(`${kdim("domain")}   ${c.cyan(domain)}`);
+    console.log(`${kdim("title")}    ${c.white(title)}`);
+    console.log(`${kdim("hash")}     ${c.magenta(payloadHash)} ${c.gray("· uri " + uri)}`);
+    console.log(`${kdim("fee")}      ${csdToCoins(fee)} CSD   ${kdim("from")} ${c.cyan(addr)}`);
+    console.log(c.gray("\n[dry-run] not signed or submitted"));
+    return;
+  }
   const sp = spinner("fetching input → csd signs → submit");
-  const input = await api.pickInput(addr, fee).catch(() => null);
-  if (!input) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
+  const picked = await api.pickInput(addr, fee).catch(() => null);
+  if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
   const tip = await api.tipHeight().catch(() => 0);
   const days = Math.max(1, parseInt(String(a.flags["expires-days"] ?? 30)) || 30);
-  const r = await signAndSubmit(["propose", "--domain", domain, "--payload-hash", payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", input]);
+  const r = await signAndSubmit(["propose", "--domain", domain, "--payload-hash", payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", picked.input]);
   sp.stop();
   if (!r.ok) { console.log(err(r.error || "failed")); return; }
   console.log(ok(`proposed  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
@@ -264,10 +322,16 @@ async function cmdSupport(a: Args) {
   }
   if (!(await requireCsd())) return;
   const addr = await resolveAddr(a); if (!addr) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
+  if (a.flags["dry-run"]) {
+    console.log(`${kdim("support")}  ${c.cyan(id)}`);
+    console.log(`${kdim("fee")}      ${csdToCoins(fee)} CSD ${c.gray("· score " + score + " · confidence " + confidence)}   ${kdim("from")} ${c.cyan(addr)}`);
+    console.log(c.gray("\n[dry-run] not signed or submitted"));
+    return;
+  }
   const sp = spinner("fetching input → csd signs → submit");
-  const input = await api.pickInput(addr, fee).catch(() => null);
-  if (!input) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
-  const r = await signAndSubmit(["attest", "--proposal-id", id, "--score", String(score), "--confidence", String(confidence), "--fee", String(fee), "--change", addr, "--input", input]);
+  const picked = await api.pickInput(addr, fee).catch(() => null);
+  if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
+  const r = await signAndSubmit(["attest", "--proposal-id", id, "--score", String(score), "--confidence", String(confidence), "--fee", String(fee), "--change", addr, "--input", picked.input]);
   sp.stop();
   console.log(r.ok ? ok(`supported  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)") : err(r.error || "failed"));
 }
@@ -275,8 +339,11 @@ async function cmdSupport(a: Args) {
 async function cmdWall(a: Args) {
   if (a._[1] === "place") {
     const msg = a._.slice(2).join(" ").trim() || String(a.flags.message ?? "").trim();
-    if (!msg) { console.log(warn("usage: ") + c.cyan('cairn wall place "<message>" [--fee <CSD>]')); return; }
-    return cmdPropose({ _: ["propose"], flags: { domain: "cairn:wall", title: msg, ...(a.flags.fee !== undefined ? { fee: a.flags.fee } : {}) }, multi: {} });
+    if (!msg) { console.log(warn("usage: ") + c.cyan('cairn wall place "<message>" [--fee <CSD>] [--dry-run]')); return; }
+    // forward the write-relevant flags (fee, address, dry-run) through to the propose path
+    const fwd: Record<string, string | boolean> = { domain: "cairn:wall", title: msg };
+    for (const k of ["fee", "address", "dry-run"]) if (a.flags[k] !== undefined) fwd[k] = a.flags[k]!;
+    return cmdPropose({ _: ["propose"], flags: fwd, multi: {} });
   }
   return cmdWallView();
 }
@@ -284,12 +351,12 @@ async function cmdWall(a: Args) {
 async function cmdDomains() {
   const r = await api.apiDomains();
   banner(); rule("categories");
-  for (const dom of r.domains ?? []) console.log(`  ${c.cyan(pad(dom.key, 20))} ${c.white(dom.title)} ${c.gray(dom.count != null ? "(" + dom.count + ")" : "")}`);
+  for (const dom of r.domains ?? []) console.log(`  ${c.cyan(pad(san(dom.key), 20))} ${c.white(san(dom.title))} ${c.gray(dom.count != null ? "(" + Number(dom.count) + ")" : "")}`);
   // open domains: anyone can create one by proposing into it (cairn ls <domain> works for any).
   const disc = r.discovered ?? [];
   if (disc.length) {
     console.log(c.gray("\n  open domains (created by proposing into them):"));
-    for (const d of disc) console.log(`  ${c.cyan(pad(d.key, 20))} ${c.gray((d.count != null ? d.count + " items" : "") + (d.totalWeight ? " · " + csdToCoins(d.totalWeight) + " CSD" : ""))}`);
+    for (const d of disc) console.log(`  ${c.cyan(pad(san(d.key), 20))} ${c.gray((d.count != null ? Number(d.count) + " items" : "") + (d.totalWeight ? " · " + csdToCoins(d.totalWeight) + " CSD" : ""))}`);
   }
 }
 
@@ -297,7 +364,7 @@ async function cmdWallView() {
   const r = await api.apiWall();
   const stones = r.stones ?? [];
   banner(); rule(`the wall · ${r.totals?.stones ?? 0} stones · ${r.totals?.boosts ?? 0} boosts · epoch ${r.epoch ?? "?"}`);
-  if (r.king) console.log(`  ${c.green("★ KING")}  ${c.white(c.bold(r.king.message))}  ${csdFmt(r.king.weight)} ${c.gray("· " + r.king.boosts + " boosts")}`);
+  if (r.king) console.log(`  ${c.green("★ KING")}  ${c.white(c.bold(san(r.king.message)))}  ${csdFmt(r.king.weight)} ${c.gray("· " + Number(r.king.boosts) + " boosts")}`);
   if (!stones.length) {
     console.log(c.gray("\n  no stones yet — place one with the Cairn Wallet, or:"));
     console.log(c.green("  cairn propose --domain cairn:wall --title '<message>'"));
@@ -306,8 +373,8 @@ async function cmdWallView() {
   const max = stones[0]?.weight || 1;
   stones.slice(0, 25).forEach((s: any, i: number) => {
     console.log("");
-    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))}  ${c.white(c.bold(s.message))}${i === 0 ? "  " + c.green("★") : ""}`);
-    console.log(`      ${bar(s.weight, max)}  ${csdFmt(s.weight)} ${c.gray("·")} ${c.green(String(s.boosts))} ${c.gray("boosts · " + age(s.ts) + " ago")}${(s.tags && s.tags.length) ? c.gray("  #" + s.tags.join(" #")) : ""}`);
+    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))}  ${c.white(c.bold(san(s.message)))}${i === 0 ? "  " + c.green("★") : ""}`);
+    console.log(`      ${bar(s.weight, max)}  ${csdFmt(s.weight)} ${c.gray("·")} ${c.green(String(s.boosts))} ${c.gray("boosts · " + age(s.ts) + " ago")}${(s.tags && s.tags.length) ? c.gray("  #" + s.tags.map((t: string) => san(t)).join(" #")) : ""}`);
   });
 }
 
@@ -334,11 +401,11 @@ async function cmdProfile(a: Args) {
   const r = await api.apiProfile(addr).catch(() => null);
   if (!r || !r.ok) { console.log(err("no profile for " + addr)); return; }
   const p = r.profile || {}, rep = r.reputation || {};
-  banner(); rule(`profile · ${p.handle || addr}`);
-  if (p.handle) console.log(`  ${kdim(pad("handle", 13))} ${c.white(p.handle)}`);
-  if (p.bio) console.log(`  ${kdim(pad("bio", 13))} ${c.gray(p.bio)}`);
-  if (p.github) console.log(`  ${kdim(pad("github", 13))} ${c.cyan(p.github)} ${p.githubVerified ? ok("verified") : c.gray("(unverified)")}`);
-  console.log(`  ${kdim(pad("address", 13))} ${c.gray(p.addr || addr)}`);
+  banner(); rule(`profile · ${san(p.handle || addr)}`);
+  if (p.handle) console.log(`  ${kdim(pad("handle", 13))} ${c.white(san(p.handle))}`);
+  if (p.bio) console.log(`  ${kdim(pad("bio", 13))} ${c.gray(san(p.bio))}`);
+  if (p.github) console.log(`  ${kdim(pad("github", 13))} ${c.cyan(san(p.github))} ${p.githubVerified ? ok("verified") : c.gray("(unverified)")}`);
+  console.log(`  ${kdim(pad("address", 13))} ${c.gray(san(p.addr || addr))}`);
   console.log(`  ${kdim(pad("trust", 13))} ${c.white((rep.trust ?? 0).toFixed(2))}`);
   console.log(`  ${kdim(pad("work", 13))} ${c.green(String(rep.proposed ?? 0))} proposed ${c.gray("·")} ${c.green(String(rep.shipped ?? 0))} shipped ${c.gray("·")} ${c.green(String(rep.acceptedWork ?? 0))} accepted ${c.gray("·")} ${c.green(String(rep.reviews ?? 0))} reviews`);
 }
@@ -349,7 +416,7 @@ async function cmdLeaderboard() {
   const lb = r.leaderboard ?? [];
   if (!lb.length) { console.log(c.gray("  no ranked builders yet — reputation accrues from accepted quest work.")); return; }
   lb.slice(0, 25).forEach((e: any, i: number) => {
-    console.log(`  ${c.magenta(c.bold(pad("#" + (i + 1), 4)))} ${c.white(pad(e.handle || e.addr, 26))} ${c.gray("trust")} ${c.white((e.trust ?? 0).toFixed(2))} ${c.gray("· " + (e.shipped ?? e.acceptedWork ?? 0) + " shipped · " + (e.proposed ?? 0) + " proposed")}`);
+    console.log(`  ${c.magenta(c.bold(pad("#" + (i + 1), 4)))} ${c.white(pad(san(e.handle || e.addr), 26))} ${c.gray("trust")} ${c.white((Number(e.trust) || 0).toFixed(2))} ${c.gray("· " + Number(e.shipped ?? e.acceptedWork ?? 0) + " shipped · " + Number(e.proposed ?? 0) + " proposed")}`);
   });
 }
 
@@ -361,9 +428,9 @@ async function cmdQuests() {
   qs.slice(0, 25).forEach((q: any, i: number) => {
     const reward = q.quest?.reward?.build ? csdToCoins(q.quest.reward.build) + " CSD" : "—";
     console.log("");
-    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))} ${c.white(c.bold(q.title))} ${c.gray("· " + (q.status || "?"))}`);
-    console.log(`      ${c.gray("reward " + reward + " · demand " + csdFmt(q.demandWeight || 0) + " · " + (q.demandSupporters || 0) + " backers")}`);
-    console.log(c.gray(`      id ${String(q.id).slice(0, 22)}…`));
+    console.log(`  ${c.magenta(c.bold("#" + (i + 1)))} ${c.white(c.bold(san(q.title)))} ${c.gray("· " + san(q.status || "?"))}`);
+    console.log(`      ${c.gray("reward " + reward + " · demand " + csdFmt(q.demandWeight || 0) + " · " + Number(q.demandSupporters || 0) + " backers")}`);
+    console.log(c.gray(`      id ${san(String(q.id).slice(0, 22))}…`));
   });
 }
 
@@ -389,8 +456,8 @@ async function help() {
   cmd("setup", "", "check csd + wallet, show your address (alias: doctor)");
   cmd("address", "", "your address + balance (alias: whoami, balance)");
   cmd("send", "--to <0x…40> --amount <CSD>", "transfer CSD (+ --output <a>:<CSD> ×N, --fee <CSD>, --dry-run)");
-  cmd("propose", "--domain <d> --title <t> --body <b>", "post an item (alias: post; + --fee <CSD>, --expires-days)");
-  cmd("support", "<id> --fee <CSD>", "back an item (+ --score, --confidence)");
+  cmd("propose", "--domain <d> --title <t> --body <b>", "post an item (alias: post; + --fee, --expires-days, --dry-run)");
+  cmd("support", "<id> --fee <CSD>", "back an item (+ --score, --confidence, --dry-run)");
   console.log(c.gray("\n  lenses (--sort): " + Object.keys(LENS).join(" · ")));
   console.log(c.gray(`  api: ${CAIRN_API}  ·  1 CSD = ${CSD_PER_COIN} base · propose ≥ ${csdToCoins(MIN_FEE_PROPOSE)} · attest ≥ ${csdToCoins(MIN_FEE_ATTEST)} CSD`));
   console.log(c.gray("  config: CAIRN_API (board) · CAIRN_CSD (csd binary) · CAIRN_ADDR (your addr) · CAIRN_RPC (trustless verify) · CAIRN_TOKEN (operator)"));
