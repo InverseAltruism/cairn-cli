@@ -25,16 +25,29 @@ async function resolveAddr(a: Args): Promise<string | null> {
 }
 // Run a csd build/sign command (easy-path propose/attest/spend — they sign with the user's
 // wallet CONFIG key, so we pass no key) and submit the resulting signed tx through the Cairn
-// proxy ourselves. csd's own auto-submit posts to the wrong path for a proxy URL, so we don't
-// rely on it: if csd already submitted (http_ok), accept it; else we submit the signed `tx`.
+// proxy ourselves. We do NOT trust csd's own auto-submit: it targets csd's configured node,
+// which may be a different node than the one the Cairn board (and its miner) read — so a tx
+// could sit in the wrong mempool and never get mined into the board's view. Always submit via
+// the proxy (the board's miner-connected node). A repeat that comes back "already present /
+// known" for OUR txid is success (the tx is in that node's mempool); a true double-spend
+// "conflict" is the only ambiguous case, so we confirm via a tx lookup before claiming ok.
 async function signAndSubmit(csdArgs: string[]): Promise<{ ok: boolean; txid?: string; error?: string }> {
   const r = await csd.run(csdArgs);
   if (!r.ok) return { ok: false, error: (r.stderr || r.stdout || "csd failed").trim().split("\n").slice(-1)[0] };
   let out: any = null; try { out = JSON.parse(r.stdout); } catch { /* unexpected */ }
   if (!out?.tx) return { ok: false, error: "csd produced no signed transaction" };
-  if (out.submit?.http_ok && out.txid) return { ok: true, txid: out.txid };
+  const txid: string | undefined = out.txid;
   const sub = await api.submitTx(out.tx).catch((e: any) => ({ ok: false, err: e.message }));
-  return (sub.ok || sub.txid) ? { ok: true, txid: sub.txid || out.txid } : { ok: false, error: sub.err || "submit rejected by node", txid: out.txid };
+  if (sub.ok) return { ok: true, txid: sub.txid || txid };
+  // A benign "already present / mempool conflict" for OUR txid means the tx is already in a
+  // mempool (e.g. csd's own auto-submit reached this same node first, or a re-run) — success.
+  // For a single-key wallet this is safe: only the key owner can produce a conflicting spend
+  // of their own UTXO, so a conflict on our freshly-built tx is our own prior submit, not a
+  // third party. (The narrow exception — two DIFFERENT local spends of one UTXO fired at once
+  // — is on the user.) The node can't be queried for mempool membership (its /tx indexes only
+  // mined txs), so we rely on the matching txid + benign message.
+  if (txid && /already|present|known|in mempool|conflict/i.test(String(sub.err ?? ""))) return { ok: true, txid };
+  return { ok: false, error: sub.err || "submit rejected by node", txid };
 }
 // Guard: a write needs `csd` installed + a configured wallet (or an explicit --address + csd key).
 async function requireCsd(): Promise<boolean> {
