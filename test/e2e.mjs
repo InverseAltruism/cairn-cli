@@ -68,14 +68,42 @@ if (open) {
   check(`ls <open domain ${open.key}> serves it (${open.count} items)`, Array.isArray(oi) && oi.length === open.count);
 } else { check("open-domain browse skipped (none discovered)", true); }
 
+console.log("\n— telemetry / social / identity reads —");
+const net = run(["network"]).out;
+check("network prints hashrate + block height", /hashrate/.test(net) && /block height/.test(net));
+check("stats is an alias for network", /hashrate/.test(run(["stats"]).out));
+check("wall renders (King/top stones, or an empty-wall notice)", /the wall|no stones/i.test(run(["wall"]).out));
+check("quests renders (open quests, or an empty notice)", /quests/i.test(run(["quests"]).out));
+check("leaderboard renders (ranked builders, or an empty notice)", /leaderboard|reputation/i.test(run(["leaderboard"]).out));
+check("top is an alias for ls", /#1|no items here/.test(run(["top", "all"]).out));
+// profile: pick a real proposer from the board if we have one, else assert the not-found path
+const someAddr = items.find((i) => /^0x[0-9a-fA-F]{40}$/.test(i.proposer || ""))?.proposer;
+if (someAddr) check("profile <addr> renders identity/reputation", /profile|trust|address/i.test(run(["profile", someAddr]).out));
+else check("profile <unknown> → graceful 'no profile' (no crash)", /no profile/i.test(run(["profile", "0x"+"11".repeat(20)]).out));
+check("watch (non-TTY) prints one snapshot and exits", /#1|no items here/.test(run(["watch", "all"]).out));
+
+console.log("\n— address resolution (no csd) —");
+check("address without csd/addr → guidance (no crash)", /address|setup|csd/i.test(run(["address"]).out));
+check("address --address <0x40> (non-TTY) echoes the bare address", run(["address", "--address", "0x"+"ab".repeat(20)]).out.trim() === "0x"+"ab".repeat(20));
+
+console.log("\n— write-arg validation (pre-sign, no csd needed) —");
+check("send bad recipient → 'bad recipient'", /bad recipient/i.test(run(["send", "--to", "0xnothex", "--amount", "1"]).out));
+check("send bad amount → 'bad amount'", /bad amount/i.test(run(["send", "--to", "0x"+"cc".repeat(20), "--amount", "-5"]).out));
+check("send malformed --output → 'bad --output'", /bad --output/i.test(run(["send", "--output", "missingcolon"]).out));
+check("send with no outputs → usage", /usage/.test(run(["send"]).out));
+check("support non-hex id → '0x…64' rejection (before any signing)", /0x…64/.test(run(["support", "deadbeef", "--fee", "0.05"]).out));
+check("propose missing domain/title → usage", /usage/.test(run(["propose", "--body", "no domain or title"]).out));
+
 console.log("\n— error & edge paths —");
 check("show <bad id> → 'not found', no crash", /not found/.test(run(["show", "0xdeadbeef"]).out));
 check("verify with no id → usage hint", /usage/.test(run(["verify"]).out));
 check("unreachable API → friendly 'cannot reach' (no stack trace)", /cannot reach/i.test(run(["ls"], { CAIRN_API: "http://127.0.0.1:9" }).out));
+check("no stack traces leak on the unreachable path", !/ at .*\(.*:\d+:\d+\)/.test(run(["ls"], { CAIRN_API: "http://127.0.0.1:9" }).out));
 check("propose without csd → guides to install/csd wallet", /csd|wallet/i.test(run(["propose", "--domain", "csd:test", "--title", "x", "--body", "y"]).out));
 check("support without csd → guides (or rejects bad id)", /csd|wallet|0x…64/i.test(run(["support", "0x"+"ab".repeat(32), "--fee", "0.05"]).out));
 check("help lists the wallet section (setup/send)", /setup/.test(run(["help"]).out) && /send/.test(run(["help"]).out));
 check("send without csd → guides", /csd|wallet/i.test(run(["send", "--to", "0x"+"cc".repeat(20), "--amount", "0.01"]).out));
+check("--no-color yields zero ANSI escapes (clig.dev)", !/\x1b\[/.test(spawnSync("node", [CLI, "network", "--no-color"], { env: { ...process.env, CAIRN_API: API, CAIRN_COLOR: "1" }, encoding: "utf8", timeout: 20000 }).stdout || ""));
 
 console.log("\n— write path (opt-in: CLI_E2E_WRITE=1) —");
 let token = process.env.CAIRN_TOKEN;

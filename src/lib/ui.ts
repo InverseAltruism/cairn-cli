@@ -70,6 +70,14 @@ export function csd(base: number): string {
   return c.green(`${(base / 1e8).toLocaleString(undefined, { maximumFractionDigits: 4 })}`) + c.gray(" CSD");
 }
 
+// Strip C0/C1 control chars (incl. ESC) from UNTRUSTED strings before printing them to a
+// TTY, so a hostile server/chain field (title, body, message, handle, bio, domain, id…)
+// can't inject ANSI/OSC escapes to spoof output — e.g. cursor-up + repaint to overwrite a
+// "✗ MISMATCH" verdict with "✓ VERIFIED", rewrite the window title, or hijack the terminal.
+// Display-only: NEVER apply to bytes that get hashed/verified (it would change the hash).
+const CTRL = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f]", "g");
+export function san(s: unknown): string { return String(s ?? "").replace(CTRL, ""); }
+
 export function ok(s: string): string { return c.green("✓ ") + s; }
 export function warn(s: string): string { return c.gray("⚠ ") + s; }
 export function err(s: string): string { return c.red("✗ ") + s; }
@@ -81,15 +89,25 @@ export function pad(s: string, n: number): string {
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export const isTty = TTY;
+export const anim = ANIM;
 
 // Phosphor braille spinner for network/async work. Writes to STDERR (clig.dev: keep
 // stdout clean for piping) and is a no-op when output isn't an interactive terminal.
-export function spinner(label: string): { stop: (final?: string) => void } {
-  if (!ANIM) return { stop: (final?: string) => { if (final) console.log(final); } };
+// After ~1.5s it shows an elapsed counter so a slow node read doesn't look hung;
+// stop() prints a clean ✓ (or a caller-supplied final line) on stdout.
+export function spinner(label: string): { stop: (final?: string) => void; update: (l: string) => void } {
+  if (!ANIM) return { stop: (final?: string) => { if (final) console.log(final); }, update: () => {} };
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-  let i = 0;
-  const t = setInterval(() => process.stderr.write(`\r${c.green(frames[i++ % frames.length]!)} ${c.gray(label)} `), 80);
+  let i = 0, lbl = label;
+  const t0 = Date.now();
+  const paint = () => {
+    const el = (Date.now() - t0) / 1000;
+    const tail = el >= 1.5 ? c.faint(` ${el.toFixed(0)}s`) : "";
+    process.stderr.write(`\r\x1b[K${c.green(frames[i++ % frames.length]!)} ${c.gray(lbl)}${tail} `);
+  };
+  const t = setInterval(paint, 80); paint();
   return {
+    update: (l: string) => { lbl = l; },
     stop: (final?: string) => {
       clearInterval(t);
       process.stderr.write("\r\x1b[K");
@@ -98,24 +116,49 @@ export function spinner(label: string): { stop: (final?: string) => void } {
   };
 }
 
-// Fast decode-reveal of the CAIRN wordmark: scramble glyphs resolve L→R into white
-// letters with a green cursor — the site's "boot" feel. ~360ms, and only on an
-// interactive TTY (static banner otherwise, so help piped to a file isn't garbage).
+// Type a line out character-by-character to stdout — the site's boot typewriter, in the
+// terminal. Falls back to an instant write when animation is off. ~`cps` chars/sec.
+export async function typeOut(text: string, cps = 220): Promise<void> {
+  if (!ANIM) { process.stdout.write(text + "\n"); return; }
+  const step = Math.max(4, Math.round(1000 / cps));
+  for (let i = 1; i <= text.length; i++) {
+    process.stdout.write(`\r\x1b[K${text.slice(0, i)}${c.green("▋")}`);
+    await sleep(step);
+  }
+  process.stdout.write(`\r\x1b[K${text}\n`);
+}
+
+// Decode-reveal of the CAIRN wordmark: each glyph scrambles a few times then locks to a
+// bright-white letter, resolving left→right behind a green cursor — the site's "boot"
+// feel. ~420ms cap, interactive TTY only (static banner otherwise, so `help` piped to a
+// file isn't escape-code garbage). Followed by a typed strap-line + rule.
 export async function bannerAnimated(): Promise<void> {
   if (!ANIM) { banner(); return; }
   const word = "CAIRN";
-  const pool = "▖▗▘▙▚▛▜▝▞▟01#%/\\<>=".split("");
+  const pool = "▖▗▘▙▚▛▜▝▞▟01#%/\\<>=$".split("");
   const rnd = () => pool[Math.floor(Math.random() * pool.length)]!;
+  const HOLD = 3; // scramble frames each not-yet-locked glyph shows before the head passes it
   for (let step = 0; step <= word.length; step++) {
-    let s = "";
-    for (let i = 0; i < word.length; i++) s += i < step ? c.white(c.bold(word[i]!)) : c.green(rnd());
-    process.stdout.write(`\r  ${c.gray("▓▒░")} ${s} ${c.green("▋")}  ${c.gray("· " + TAG)}   `);
-    await sleep(60);
+    for (let f = 0; f < (step < word.length ? HOLD : 1); f++) {
+      let s = "";
+      for (let i = 0; i < word.length; i++) {
+        if (i < step) s += c.white(c.bold(word[i]!));
+        else if (i === step) s += c.green(c.bold(rnd())); // the glyph currently resolving
+        else s += c.faint(rnd());
+      }
+      process.stdout.write(`\r\x1b[K  ${c.gray("▓▒░")} ${s} ${c.green("▋")}  ${c.faint("· " + TAG)}`);
+      await sleep(26);
+    }
   }
-  process.stdout.write(`\r  ${c.gray("▓▒░")} ${c.white(c.bold(word))} ${c.green("▮")}  ${c.gray("· " + TAG)}\n`);
+  process.stdout.write(`\r\x1b[K  ${c.gray("▓▒░")} ${c.white(c.bold(word))} ${c.green("▮")}  ${c.gray("· " + TAG)}\n`);
   rule();
 }
 
 export function clearScreen(): void {
   if (TTY) process.stdout.write("\x1b[2J\x1b[H");
+}
+// Move the cursor home and clear from there to the end of screen — repaints in place
+// without the full-screen black flash `clearScreen` causes. Used by `watch`.
+export function cursorHome(): void {
+  if (TTY) process.stdout.write("\x1b[H\x1b[0J");
 }
