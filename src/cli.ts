@@ -5,6 +5,9 @@ import { CAIRN_API, CAIRN_ADDR, CAIRN_TOKEN, CAIRN_RPC, MIN_FEE_PROPOSE, MIN_FEE
 import * as api from "./lib/api.js";
 import * as csd from "./lib/csd.js";
 import { buildCommitment } from "./lib/item.js";
+import { buildGatewayRecord, buildPeerRecord, buildIdentityCommit, buildIdentityReveal } from "@inversealtruism/csd-registry";
+import { canonicalJson } from "@inversealtruism/csd-codec";
+import { randomBytes } from "node:crypto";
 import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, anim, clearScreen, cursorHome, san } from "./lib/ui.js";
 
 const CSD = (n: number) => Number.isFinite(n) ? Math.round(n * CSD_PER_COIN) : NaN; // CSD → base units
@@ -485,7 +488,90 @@ async function main() {
     case "send": return cmdSend(a);
     case "propose": case "post": return cmdPropose(a);
     case "support": return cmdSupport(a);
+    case "gateway": return cmdGateway(a);
+    case "peer": return cmdPeer(a);
+    case "identity": return cmdIdentity(a);
     default: return help();
   }
 }
+// ── L3 registry publish commands (build a signed record → anchor Propose → serve bytes) ──
+
+// Anchor a built registry record: Propose{domain, payloadHash} signed by the csd wallet,
+// then publish the EXACT canonical bytes to the content origin (self-certified on arrival).
+async function anchorRecord(rec: { domain: string; content: object; payloadHash: string }, addr: string, fee: number, days: number, label: string): Promise<boolean> {
+  const uri = "csd:" + rec.domain.replace(/[^a-z]/gi, "").slice(0, 6) + ":v1:" + rec.payloadHash.slice(2, 14);
+  const sp = spinner("fetching input → csd signs → submit");
+  const picked = await api.pickInput(addr, fee).catch(() => null);
+  if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return false; }
+  const tip = await api.tipHeight().catch(() => 0);
+  const r = await signAndSubmit(["propose", "--domain", rec.domain, "--payload-hash", rec.payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", picked.input]);
+  sp.stop();
+  if (!r.ok) { console.log(err(r.error || "failed")); return false; }
+  console.log(ok(`${label} anchored  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
+  const sp2 = spinner("publishing content (waits for the tx to mine)");
+  const done = await api.registerRawContent(canonicalJson(rec.content), r.txid!);
+  sp2.stop();
+  console.log(done ? ok("content published — record is now resolvable") : warn("content not published yet — re-run once mined"));
+  return done;
+}
+
+// Shared setup for the registry commands: require csd, the privkey (to sign the binding
+// locally — never networked), and the address.
+async function registryPrep(a: Args): Promise<{ priv: string; addr: string } | null> {
+  if (!(await requireCsd())) return null;
+  const cfg = await csd.walletConfig();
+  const priv = cfg?.default_privkey;
+  if (!priv) { console.log(err("no csd wallet key configured.") + c.gray("  Run ") + c.cyan("csd wallet new")); return null; }
+  const addr = await resolveAddr(a); if (!addr) { console.log(err("could not resolve your address — run ") + c.cyan("cairn setup")); return null; }
+  return { priv, addr };
+}
+
+async function cmdGateway(a: Args) {
+  if (a._[1] !== "register") { console.log(warn("usage: ") + c.cyan("cairn gateway register --url https://gw/content/0x{hash} [--pin] [--fee 0.25]")); return; }
+  const url = String(a.flags.url ?? "");
+  if (!url.includes("{hash}")) { console.log(err("--url must contain the {hash} template, e.g. https://gw/content/0x{hash}")); return; }
+  const p = await registryPrep(a); if (!p) return;
+  const rec = buildGatewayRecord({ priv: p.priv, url, kind: a.flags.pin ? "pin" : "gateway", address: p.addr });
+  const fee = Math.max(MIN_FEE_PROPOSE, a.flags.fee !== undefined ? CSD(Number(a.flags.fee)) : MIN_FEE_PROPOSE);
+  if (a.flags["dry-run"]) { console.log(`${kdim("domain")} ${c.cyan(rec.domain)}\n${kdim("url")}    ${c.white(url)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
+  await anchorRecord(rec, p.addr, fee, 10, "gateway");
+}
+
+async function cmdPeer(a: Args) {
+  if (a._[1] !== "announce") { console.log(warn("usage: ") + c.cyan("cairn peer announce --peer-id <id> --addr /ip4/…/tcp/… [--addr …] [--cap full] [--fee 0.25]")); return; }
+  const peerId = String(a.flags["peer-id"] ?? "");
+  const multiaddrs = (a.multi.addr ?? (a.flags.addr ? [String(a.flags.addr)] : [])).filter(Boolean);
+  if (!peerId || multiaddrs.length === 0) { console.log(err("--peer-id and at least one --addr required")); return; }
+  const p = await registryPrep(a); if (!p) return;
+  const caps = (a.multi.cap ?? (a.flags.cap ? [String(a.flags.cap)] : [])).filter(Boolean);
+  const rec = buildPeerRecord({ priv: p.priv, peer_id: peerId, multiaddrs, caps: caps.length ? caps : undefined, address: p.addr });
+  const fee = Math.max(MIN_FEE_PROPOSE, a.flags.fee !== undefined ? CSD(Number(a.flags.fee)) : MIN_FEE_PROPOSE);
+  if (a.flags["dry-run"]) { console.log(`${kdim("domain")} ${c.cyan(rec.domain)}\n${kdim("peer")}   ${c.white(peerId)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
+  await anchorRecord(rec, p.addr, fee, 10, "peer");
+}
+
+async function cmdIdentity(a: Args) {
+  const sub = a._[1];
+  const handle = String(a.flags.handle ?? a._[2] ?? "");
+  if (sub !== "claim" || !handle) { console.log(warn("usage: ") + c.cyan("cairn identity claim <handle> [--salt <hex>] [--commit-only|--reveal] [--fee 0.25]")); console.log(c.gray("  step 1: --commit-only (saves a salt)  ·  step 2 (next epoch): --reveal --salt <hex>")); return; }
+  if (!/^[a-z0-9_.-]{3,32}$/i.test(handle)) { console.log(err("handle must be 3–32 chars [a-z0-9_.-]")); return; }
+  const p = await registryPrep(a); if (!p) return;
+  const fee = Math.max(MIN_FEE_PROPOSE, a.flags.fee !== undefined ? CSD(Number(a.flags.fee)) : MIN_FEE_PROPOSE);
+
+  if (a.flags.reveal) {
+    const salt = String(a.flags.salt ?? "");
+    if (!/^[0-9a-f]{16,}$/i.test(salt)) { console.log(err("--salt <hex> from your earlier --commit-only step is required to reveal")); return; }
+    const rec = buildIdentityReveal({ priv: p.priv, handle, salt, address: p.addr });
+    if (a.flags["dry-run"]) { console.log(`${kdim("reveal")} ${c.white(handle)} → ${c.cyan(p.addr)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed")); return; }
+    await anchorRecord(rec, p.addr, fee, 90, "identity reveal");
+    return;
+  }
+  // default / --commit-only: step 1
+  const salt = String(a.flags.salt ?? randomBytes(16).toString("hex"));
+  const rec = buildIdentityCommit({ handle, salt, address: p.addr });
+  if (a.flags["dry-run"]) { console.log(`${kdim("commit")} ${c.white(handle)}\n${kdim("salt")}   ${c.magenta(salt)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed")); return; }
+  const okc = await anchorRecord(rec, p.addr, fee, 90, "identity commit");
+  if (okc) console.log(c.gray("\n  save this salt — reveal NEXT epoch (~1h):  ") + c.cyan(`cairn identity claim ${handle} --reveal --salt ${salt}`));
+}
+
 main().catch((e) => { console.error(err(String(e?.message ?? e))); process.exit(1); });

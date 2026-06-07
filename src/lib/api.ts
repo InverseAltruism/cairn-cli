@@ -86,6 +86,16 @@ export async function registerContent(content: any, txid: string, attempts = 20)
   return false;
 }
 
+// Register an L3 registry record's EXACT canonical bytes (origin serves them verbatim;
+// accepted only if sha256(bytes) == the on-chain payload_hash). Retries while it mines.
+export async function registerRawContent(bytes: string, txid: string, attempts = 20): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    try { const r = await req("/api/content", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ bytes, txid }) }); if (r.ok) return true; } catch { /* keep trying while it mines */ }
+    await new Promise((res) => setTimeout(res, 8000));
+  }
+  return false;
+}
+
 // optional: query a raw csd node RPC (for trustless verify)
 export async function chainProposal(id: string): Promise<any | null> {
   if (!CAIRN_RPC) return null;
