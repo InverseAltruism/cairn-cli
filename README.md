@@ -91,9 +91,16 @@ Fees and amounts are in **CSD** (e.g. `--amount 1.5`, `--fee 0.05`). Minimums: 0
 - `verify` fetches an item, recomputes `sha256(canonical content)` locally, and if `CAIRN_RPC` is set,
   confirms that hash is the one committed on-chain. You trust the math, not the server.
 - `send` / `propose` / `support` / `wall place`: cairn-cli fetches a spendable input from the Cairn
-  proxy, hands it to **your** `csd` (which signs with your wallet key — the key never leaves your
-  machine and never touches cairn-cli), then submits the signed transaction through the proxy and (for
-  proposals) registers the off-chain content. Sealed claims and Sign-in-with-CSD live in the Cairn Wallet.
+  proxy, hands it to **your** `csd` (which signs with your wallet key — for these commands the key
+  stays inside `csd` and never enters the cairn-cli process), then submits the signed transaction
+  through the proxy and (for proposals) registers the off-chain content. Sealed claims and
+  Sign-in-with-CSD live in the Cairn Wallet.
+- **L3 registry commands** (`gateway register`, `peer announce`, `identity claim`) are the one
+  exception: they sign a registry *binding* with `@inversealtruism/csd-registry`, so cairn-cli reads
+  your private key from `csd wallet config` and signs **in-process** (the key is never networked — only
+  the signed canonical content is published). Because these load key material into the Node process,
+  the `csd-registry` / `csd-codec` dependencies are **pinned to exact versions** (no caret ranges) to
+  shrink the supply-chain surface. If you only ever `send`/`propose`/`support`, your key never leaves `csd`.
 
 ## License
 
