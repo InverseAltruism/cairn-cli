@@ -7,7 +7,9 @@ import * as csd from "./lib/csd.js";
 import { buildCommitment } from "./lib/item.js";
 import { buildGatewayRecord, buildPeerRecord, buildIdentityCommit, buildIdentityReveal } from "@inversealtruism/csd-registry";
 import { canonicalJson } from "@inversealtruism/csd-codec";
+import { cairnxGet, activeCairnxBase, buildTransferRecord, humanToBase, baseToHuman, CAIRNX_DOMAIN, CAIRNX_ANCHOR_FEE, TICKER_RE, NAME_RE } from "./lib/cairnx.js";
 import { randomBytes } from "node:crypto";
+import { createInterface } from "node:readline";
 import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, anim, clearScreen, cursorHome, san } from "./lib/ui.js";
 
 const CSD = (n: number) => Number.isFinite(n) ? Math.round(n * CSD_PER_COIN) : NaN; // CSD → base units
@@ -461,9 +463,16 @@ async function help() {
   cmd("send", "--to <0x…40> --amount <CSD>", "transfer CSD (+ --output <a>:<CSD> ×N, --fee <CSD>, --dry-run)");
   cmd("propose", "--domain <d> --title <t> --body <b>", "post an item (alias: post; + --fee, --expires-days, --dry-run)");
   cmd("support", "<id> --fee <CSD>", "back an item (+ --score, --confidence, --dry-run)");
+  console.log("");
+  console.log(c.bold("  cairnx") + c.gray("  (tokens + .csd names on the CairnX layer)"));
+  cmd("tokens", "[address]", "token balances + .csd names (default: your address)");
+  cmd("token-info", "<TICKER>", "supply · minted · mint mode · top-10 holders (alias: token)");
+  cmd("token-send", "--ticker T --to 0x…40 --amount <n>", "send tokens (anchors a 0.25 CSD transfer record; --dry-run, --yes)");
+  cmd("names", "[address]", "owned .csd names");
+  cmd("name", "<name>", "one name: owner · lease · open offer");
   console.log(c.gray("\n  lenses (--sort): " + Object.keys(LENS).join(" · ")));
   console.log(c.gray(`  api: ${CAIRN_API}  ·  1 CSD = ${CSD_PER_COIN} base · propose ≥ ${csdToCoins(MIN_FEE_PROPOSE)} · attest ≥ ${csdToCoins(MIN_FEE_ATTEST)} CSD`));
-  console.log(c.gray("  config: CAIRN_API (board) · CAIRN_CSD (csd binary) · CAIRN_ADDR (your addr) · CAIRN_RPC (trustless verify) · CAIRN_TOKEN (operator)"));
+  console.log(c.gray("  config: CAIRN_API (board) · CAIRNX_API (token layer) · CAIRN_CSD (csd binary) · CAIRN_ADDR (your addr) · CAIRN_RPC (trustless verify) · CAIRN_TOKEN (operator)"));
   console.log(c.gray("  display: honors NO_COLOR · --no-color · --no-anim · TERM=dumb (color/animation auto-off when piped)"));
   console.log(c.gray("  writes are signed by your own ") + c.cyan("csd") + c.gray(" wallet (csd wallet new / init); cairn supplies the input + Cairn content. Sealed claims + Sign-in: use the Cairn Wallet."));
 }
@@ -488,6 +497,11 @@ async function main() {
     case "send": return cmdSend(a);
     case "propose": case "post": return cmdPropose(a);
     case "support": return cmdSupport(a);
+    case "tokens": return cmdTokens(a);
+    case "token-info": case "token": return cmdTokenInfo(a);
+    case "token-send": return cmdTokenSend(a);
+    case "names": return cmdNames(a);
+    case "name": return cmdName(a);
     case "gateway": return cmdGateway(a);
     case "peer": return cmdPeer(a);
     case "identity": return cmdIdentity(a);
@@ -572,6 +586,159 @@ async function cmdIdentity(a: Args) {
   if (a.flags["dry-run"]) { console.log(`${kdim("commit")} ${c.white(handle)}\n${kdim("salt")}   ${c.magenta(salt)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed")); return; }
   const okc = await anchorRecord(rec, p.addr, fee, 90, "identity commit");
   if (okc) console.log(c.gray("\n  save this salt — reveal NEXT epoch (~1h):  ") + c.cyan(`cairn identity claim ${handle} --reveal --salt ${salt}`));
+}
+
+// ── CairnX: tokens + .csd names (reads via the CairnX state API; the one write —
+//    token-send — anchors a canonical transfer record as a cairnx:v1 Propose) ──
+
+// Display: base units → human, with thousands grouping. decimals===undefined (a ticker the
+// API doesn't know) falls back to raw base units rather than guessing a scale.
+const group = (s: string) => s.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+function tokAmt(base: string, decimals: number | undefined): string {
+  if (decimals === undefined) return `${group(String(base))} (base units)`;
+  const [i, f] = baseToHuman(String(base), decimals).split(".");
+  return group(i!) + (f ? "." + f : "");
+}
+// The address a CairnX read targets: positional arg → --address/CAIRN_ADDR/csd wallet.
+async function resolveCairnxAddr(a: Args, positional?: string): Promise<string | null> {
+  if (positional !== undefined) {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(positional)) { console.log(err(`bad address: ${san(positional)}`)); return null; }
+    return positional.toLowerCase();
+  }
+  const addr = await resolveAddr(a);
+  if (!addr) console.log(err("no address — pass one (cairn tokens 0x…), or --address, or run ") + c.cyan("cairn setup"));
+  return addr ? addr.toLowerCase() : null;
+}
+// ticker → decimals map from /tokens (best-effort: an unreachable list degrades to raw units).
+async function tokenDecimals(): Promise<Record<string, number>> {
+  const list = await cairnxGet("/tokens").catch(() => []);
+  const map: Record<string, number> = {};
+  for (const t of Array.isArray(list) ? list : []) if (typeof t?.ticker === "string" && Number.isInteger(t?.decimals)) map[t.ticker] = t.decimals;
+  return map;
+}
+
+async function cmdTokens(a: Args) {
+  const addr = await resolveCairnxAddr(a, a._[1]); if (!addr) return;
+  const [acct, dec] = await Promise.all([cairnxGet(`/address/${encodeURIComponent(addr)}`), tokenDecimals()]);
+  if (a.flags.json) { console.log(JSON.stringify(acct, null, 2)); return; }
+  banner(); rule(`cairnx · ${addr.slice(0, 10)}… · ${String(activeCairnxBase() ?? "").replace(/^https?:\/\//, "")}`);
+  const bals = Object.entries(acct.balances ?? {}) as [string, any][];
+  if (!bals.length) console.log(c.gray("  no token balances"));
+  for (const [ticker, b] of bals) {
+    const locked = BigInt(String(b.locked ?? "0"));
+    console.log(`  ${c.cyan(pad(san(ticker), 14))} ${c.white(tokAmt(String(b.available ?? "0"), dec[ticker]))}${locked > 0n ? c.gray(` · ${tokAmt(String(b.locked), dec[ticker])} locked in open offers`) : ""}`);
+  }
+  const names: string[] = acct.names ?? [];
+  console.log(`\n  ${kdim(".csd names")} ${names.length ? names.map((n) => c.green(san(n))).join(c.gray(" · ")) : c.gray("none")}`);
+}
+
+async function cmdTokenInfo(a: Args) {
+  const ticker = String(a._[1] ?? "").toUpperCase();
+  if (!TICKER_RE.test(ticker)) { console.log(warn("usage: ") + c.cyan("cairn token-info <TICKER>")); return; }
+  const t = await cairnxGet(`/token/${encodeURIComponent(ticker)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unknown token ${ticker}`) : err(e.message)); return null; });
+  if (!t) return;
+  banner(); rule(`token · ${san(t.ticker)}`);
+  const row = (k: string, v: string) => console.log(`  ${kdim(pad(k, 11))} ${v}`);
+  row("name", c.white(san(t.name ?? t.ticker)));
+  row("decimals", c.white(String(t.decimals)));
+  row("supply", `${c.white(tokAmt(String(t.supply), t.decimals))} ${c.gray("max")}`);
+  const minted = BigInt(String(t.minted ?? "0")), supply = BigInt(String(t.supply ?? "0"));
+  row("minted", `${c.white(tokAmt(String(t.minted), t.decimals))}${supply > 0n ? c.gray(` · ${Number((minted * 10000n) / supply) / 100}% of supply`) : ""}`);
+  row("mint", t.mint === "open" ? c.green("open") + c.gray(` · up to ${tokAmt(String(t.mintLimit ?? "0"), t.decimals)} per mint`) : c.gray("issuer-only"));
+  row("deployer", c.gray(san(t.deployer)));
+  row("deployed", c.gray(`height ${Number(t.height)} · id ${san(String(t.deployId ?? "")).slice(0, 22)}…`));
+  // top-10 holders by total (available + locked) — the same reading the explorer shows
+  const holders = Object.entries(t.holders ?? {}).map(([h, b]: [string, any]) => ({ h, total: BigInt(String(b.available ?? "0")) + BigInt(String(b.locked ?? "0")) }))
+    .filter((x) => x.total > 0n).sort((x, y) => (y.total > x.total ? 1 : y.total < x.total ? -1 : 0));
+  console.log(`\n  ${kdim("holders")}    ${c.white(String(holders.length))}${holders.length > 10 ? c.gray(" · top 10") : ""}`);
+  const max = holders[0]?.total ?? 1n;
+  for (const { h, total } of holders.slice(0, 10)) {
+    const pct = minted > 0n ? Number((total * 10000n) / minted) / 100 : 0;
+    console.log(`  ${bar(Number((total * 1000n) / max), 1000)}  ${c.gray(san(h).slice(0, 12) + "…")} ${c.white(tokAmt(total.toString(), t.decimals))} ${c.gray(`· ${pct}%`)}`);
+  }
+}
+
+// y/N gate for the one CairnX write. Non-interactive runs behave like the CLI's other
+// writes (no prompt — use --dry-run to preview); --yes skips the prompt when interactive.
+async function confirmSend(q: string): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return true;
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const ans = await new Promise<string>((res) => rl.question(q, res)); rl.close();
+  return /^y(es)?$/i.test(ans.trim());
+}
+
+async function cmdTokenSend(a: Args) {
+  const ticker = String(a.flags.ticker ?? "").toUpperCase();
+  const to = String(a.flags.to ?? "");
+  const amountStr = String(a.flags.amount ?? "");
+  if (!ticker || !a.flags.to || a.flags.amount === undefined) { console.log(warn("usage: ") + c.cyan("cairn token-send --ticker CAIRN --to 0x…40 --amount 1.5 [--dry-run] [--yes]")); return; }
+  if (!TICKER_RE.test(ticker)) { console.log(err(`bad ticker: ${san(ticker)}`)); return; }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(to)) { console.log(err(`bad recipient: ${san(to)}`)); return; }
+  // decimals are AUTHORITATIVE from the token's deploy record — never guessed
+  const t = await cairnxGet(`/token/${encodeURIComponent(ticker)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unknown token ${ticker}`) : err(e.message)); return null; });
+  if (!t) return;
+  let amount: bigint;
+  try { amount = humanToBase(amountStr, Number(t.decimals)); } catch (e: any) { console.log(err(e.message)); return; }
+  if (amount <= 0n) { console.log(err("amount must be > 0")); return; }
+  const from = await resolveAddr(a); if (!from) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
+  // balance check against the same state the resolver will apply the transfer to
+  const acct = await cairnxGet(`/address/${encodeURIComponent(from.toLowerCase())}`);
+  const avail = BigInt(String(acct.balances?.[ticker]?.available ?? "0"));
+  if (avail < amount) { console.log(err(`insufficient ${ticker}: balance ${tokAmt(avail.toString(), t.decimals)}, tried to send ${tokAmt(amount.toString(), t.decimals)}${BigInt(String(acct.balances?.[ticker]?.locked ?? "0")) > 0n ? ` (${tokAmt(String(acct.balances[ticker].locked), t.decimals)} more is locked in open offers)` : ""}`)); return; }
+  let built; try { built = buildTransferRecord({ ticker, to, amount }); } catch (e: any) { console.log(err(e.message)); return; }
+  // clear-print exactly what will be anchored before anything signs
+  console.log(`${kdim("send")}    ${c.white(tokAmt(amount.toString(), t.decimals))} ${c.cyan(ticker)} ${c.gray(`(${amount} base units · ${t.decimals} decimals)`)}`);
+  console.log(`${kdim("to")}      ${c.cyan(to.toLowerCase())}`);
+  console.log(`${kdim("from")}    ${c.cyan(from.toLowerCase())} ${c.gray(`· ${ticker} balance ${tokAmt(avail.toString(), t.decimals)}`)}`);
+  console.log(`${kdim("record")}  ${c.white(built.uri)}`);
+  console.log(`${kdim("hash")}    ${c.magenta(built.payloadHash)}`);
+  console.log(`${kdim("anchor")}  ${c.gray(`Propose on ${CAIRNX_DOMAIN} — costs `)}${c.white(csdToCoins(CAIRNX_ANCHOR_FEE) + " CSD")}${c.gray(" (the chain fee; the tokens themselves move by record)")}`);
+  if (a.flags["dry-run"]) { console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
+  if (!(await requireCsd())) return;
+  if (!a.flags.yes && !(await confirmSend(`\nsend ${tokAmt(amount.toString(), t.decimals)} ${ticker} for ${csdToCoins(CAIRNX_ANCHOR_FEE)} CSD? [y/N] `))) { console.log(c.gray("aborted")); return; }
+  const sp = spinner("fetching input → csd signs → submit");
+  const picked = await api.pickInput(from, CAIRNX_ANCHOR_FEE).catch(() => null);
+  if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the 0.25 CSD anchor fee") + c.gray(" — fund " + from)); return; }
+  const tip = await api.tipHeight().catch(() => 0);
+  const r = await signAndSubmit(["propose", "--domain", CAIRNX_DOMAIN, "--payload-hash", built.payloadHash, "--uri", built.uri, "--expires-epoch", String(Math.floor(tip / 30) + 24), "--fee", String(CAIRNX_ANCHOR_FEE), "--change", from, "--input", picked.input]);
+  sp.stop();
+  console.log(r.ok ? ok(`transfer anchored  ${c.cyan(r.txid!)}`) + c.gray("  (tokens move when it mines — check `cairn tokens`)") : err(r.error || "failed"));
+}
+
+async function cmdNames(a: Args) {
+  const addr = await resolveCairnxAddr(a, a._[1]); if (!addr) return;
+  const acct = await cairnxGet(`/address/${encodeURIComponent(addr)}`);
+  const names: string[] = acct.names ?? [];
+  if (a.flags.json) { console.log(JSON.stringify(names, null, 2)); return; }
+  banner(); rule(`.csd names · ${addr.slice(0, 10)}…`);
+  if (!names.length) { console.log(c.gray("  no names owned — claim one on " + (activeCairnxBase()?.includes("127.0.0.1") ? "the /trade marketplace" : "https://cairn-substrate.com/trade"))); return; }
+  for (const n of names) console.log(`  ${c.green(san(n))}`);
+  console.log(c.gray(`\n  ${names.length} name${names.length === 1 ? "" : "s"} · cairn name <name> for detail`));
+}
+
+async function cmdName(a: Args) {
+  const n = String(a._[1] ?? "").toLowerCase();
+  if (!n || !NAME_RE.test(n)) { console.log(warn("usage: ") + c.cyan("cairn name <name>") + c.gray("  (lowercase, 3–32 chars [a-z0-9-])")); return; }
+  const r = await cairnxGet(`/name/${encodeURIComponent(n)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unregistered name "${n}"`) + c.gray(" — claimable via commit-reveal on /trade") : err(e.message)); return null; });
+  if (!r) return;
+  banner(); rule(`name · ${san(r.name ?? n)}`);
+  const row = (k: string, v: string) => console.log(`  ${kdim(pad(k, 10))} ${v}`);
+  row("owner", c.cyan(san(r.owner)));
+  row("claimed", c.gray(`height ${Number(r.height)}${Number(r.effectiveHeight) !== Number(r.height) ? ` · effective ${Number(r.effectiveHeight)}` : ""} · claim ${san(String(r.claimId ?? "")).slice(0, 22)}…`));
+  // lease: the API reports paidThroughEpoch once the v1.5 lease model is live; the ETA is
+  // computed from the chain tip (1 epoch = 30 blocks · 120s target ⇒ ~1h per epoch).
+  if (r.paidThroughEpoch != null) {
+    const tip = await api.tipHeight().catch(() => 0);
+    const blocksLeft = (Number(r.paidThroughEpoch) + 1) * 30 - tip;
+    const eta = !tip ? "" : blocksLeft <= 0 ? " · " + "EXPIRED" : ` · expires in ~${blocksLeft >= 720 ? (blocksLeft / 720).toFixed(1) + " days" : Math.max(1, Math.round(blocksLeft / 30)) + "h"}`;
+    row("lease", `${c.white("paid through epoch " + Number(r.paidThroughEpoch))}${blocksLeft <= 0 && tip ? "  " + err("EXPIRED") : c.gray(eta)}`);
+  } else row("lease", c.gray("— (no lease data from this API)"));
+  if (r.locked) row("locked", c.gray("yes — a sale/transfer is in flight"));
+  if (r.offer) {
+    const want = r.offer.want ?? {};
+    const price = want.value !== undefined ? `${csdToCoins(Number(want.value))} CSD` : `${san(String(want.amount))} ${san(String(want.ticker))}`;
+    row("offer", `${c.green("FOR SALE")} ${c.white("· " + price)} ${c.gray(`· seller ${san(String(r.offer.seller ?? r.owner)).slice(0, 12)}… · offer ${san(String(r.offer.id ?? "")).slice(0, 18)}…${r.offer.taker ? " · reserved for a taker" : ""}`)}`);
+  } else row("offer", c.gray("no open offer"));
 }
 
 main().catch((e) => { console.error(err(String(e?.message ?? e))); process.exit(1); });

@@ -51,6 +51,7 @@ cairn network                # live network telemetry (alias: cairn stats)
 cairn quests                 # open quests
 cairn profile <addr>         # identity + on-chain reputation
 cairn leaderboard            # top builders by reputation
+cairn tokens [address]       # CairnX token balances + .csd names (see below)
 cairn ls --json              # machine-readable output
 ```
 
@@ -77,11 +78,33 @@ cairn wall place "gm, Compute Substrate"
 Fees and amounts are in **CSD** (e.g. `--amount 1.5`, `--fee 0.05`). Minimums: 0.25 CSD to propose,
 0.05 CSD to attest. Support is a paid demand signal, not a payment to the author; fees go to miners.
 
+## CairnX (tokens + .csd names)
+
+CairnX is the token / DeFi layer that lives entirely in `cairnx:v1` records on-chain
+(traded at [cairn-substrate.com/trade](https://cairn-substrate.com/trade)). Reads hit the
+CairnX state API (`CAIRNX_API` → local service → public gateway); the one write —
+`token-send` — anchors a canonical transfer record signed by your own `csd` wallet.
+
+```bash
+cairn tokens [address]                  # token balances (locked shown) + owned .csd names
+cairn token-info CAIRN                  # supply · minted · decimals · mint mode · top-10 holders
+cairn token-send --ticker CAIRN --to 0x… --amount 1.5   # send tokens (--dry-run to preview, --yes to skip the prompt)
+cairn names [address]                   # owned .csd names
+cairn name inverse                      # one name: owner · lease · open offer
+```
+
+`token-send` amounts are **human units converted exactly** (string math, never floats):
+`--amount 1.5` on an 8-decimals token sends `150000000` base units, and `1.5` of a
+0-decimals token is an **error**, never a truncation. The transfer itself is free at the
+token layer; anchoring it on-chain costs the 0.25 CSD propose fee (printed before anything
+signs, and `--dry-run` shows the exact canonical record + hash without signing).
+
 ## Configuration (environment variables)
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CAIRN_API` | `https://cairn-substrate.com` | the board / proxy to talk to (use your own, e.g. `http://127.0.0.1:7777`) |
+| `CAIRNX_API` | local service, then the public gateway | the CairnX (token/name) state API; set it to pin one base |
 | `CAIRN_CSD` | `csd` | path to your installed `csd` binary (signs your transactions) |
 | `CAIRN_ADDR` | – | your public addr20; skips deriving it from the csd wallet |
 | `CAIRN_RPC` | – | optional csd node RPC; enables fully trustless `verify` (recompute the hash + confirm on-chain) |
@@ -97,6 +120,11 @@ Fees and amounts are in **CSD** (e.g. `--amount 1.5`, `--fee 0.05`). Minimums: 0
   stays inside `csd` and never enters the cairn-cli process), then submits the signed transaction
   through the proxy and (for proposals) registers the off-chain content. Sealed claims and
   Sign-in-with-CSD live in the Cairn Wallet.
+- **CairnX commands** (`tokens`, `token-info`, `token-send`, `names`, `name`) read the CairnX
+  state API. `token-send` builds the canonical transfer record locally (`sha256(uri)` is the
+  on-chain commitment, byte-exact-tested against the resolver's own builder), checks your
+  balance, prints the record + the 0.25 CSD anchor cost, then has `csd` sign the anchoring
+  Propose — the same no-key-in-process path as `propose`/`send`.
 - **registry commands** (`gateway register`, `peer announce`, `identity claim`) are the one
   exception: they sign a registry *binding* with `@inversealtruism/csd-registry`, so cairn-cli reads
   your private key from `csd wallet config` and signs **in-process** (the key is never networked - only
