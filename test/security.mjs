@@ -176,6 +176,20 @@ check("support: forged conflict → reported as FAILURE, never 'supported'", !/\
 const sendOk = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED })).out;
 check("send: a node-confirmed txid IS reported as 'sent' (evidence accepted, no false negative)", /\bsent\s+0x/i.test(sendOk));
 
+// UTXO-VALUE-1: a CSD fee is implicit (Σin − Σout) with NO chain max, so a hostile proxy that
+// under-reports the input — or a fat-fingered --fee — silently burns the difference. The max-fee
+// sanity guard must REFUSE an absurd fee BEFORE building/signing, with a --max-fee override.
+console.log("\n— UTXO-VALUE-1: max-fee sanity guard refuses an absurd fee (silent fund-burn) —");
+const SENDOK_ENV = { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED };
+const bigFee = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1", "--fee", "50"], SENDOK_ENV)).out;
+check("send: an absurd --fee (50 CSD on a 0.1 send) is REFUSED, never 'sent'", /abnormally high/i.test(bigFee) && !/\bsent\s+0x/i.test(bigFee));
+const bigFeeOver = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1", "--fee", "50", "--max-fee", "60"], SENDOK_ENV)).out;
+check("send: --max-fee override lets a deliberate high fee through (proceeds to 'sent')", /\bsent\s+0x/i.test(bigFeeOver));
+const bigFeeDry = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1", "--fee", "50", "--dry-run"], SENDOK_ENV)).out;
+check("send --dry-run surfaces the abnormal-fee warning and does NOT send", /abnormally high/i.test(bigFeeDry) && /dry-run/i.test(bigFeeDry) && !/\bsent\s+0x/i.test(bigFeeDry));
+const normalFee = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1"], SENDOK_ENV)).out;
+check("send: a normal default fee still passes the guard (no false positive)", /\bsent\s+0x/i.test(normalFee) && !/abnormally high/i.test(normalFee));
+
 // R12: a STALE/frozen tip must fail-closed BEFORE any tx is built or signed.
 console.log("\n— R12: a stale/frozen tip blocks tx building (fail-closed), --force-stale overrides —");
 await fetch(`${API}/__stale?on=1`);

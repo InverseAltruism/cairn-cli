@@ -13,6 +13,48 @@ import { createInterface } from "node:readline";
 import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, anim, clearScreen, cursorHome, san } from "./lib/ui.js";
 
 const CSD = (n: number) => Number.isFinite(n) ? Math.round(n * CSD_PER_COIN) : NaN; // CSD → base units
+
+// ── max-fee sanity guard (UTXO-VALUE-1) ──────────────────────────────────────────────────────
+// A CSD fee is implicit (Σin − Σout) and the chain enforces NO maximum, so a hostile proxy that
+// UNDER-reports the picked UTXO's value would make `csd` compute too-small a change and the
+// difference is silently burned to the miner as fee — the user's own funds, with no on-chain
+// protection. cairn-cli has no codec to recompute the input's REAL value (the wallet's
+// verifyInputValues path), so it applies a proportionate SANITY cap on the fee instead: the fee
+// must be ≤ max(1 CSD absolute, 25% of the tx value). Every honest fee (a 0.01 CSD transfer fee,
+// a 0.25 CSD propose) passes; a typo / hostile-inflated fee is refused. `--max-fee <CSD>` overrides.
+// Returns null if the fee is acceptable, or a human error string to print and abort.
+const MAX_FEE_ABS = 100_000_000;          // 1 CSD absolute floor — every honest fee is well under this
+const MAX_FEE_VALUE_FRACTION = 0.25;      // …and ≤ 25% of the value moved
+function feeCap(txValue: number, a: Args): number {
+  if (a.flags["max-fee"] !== undefined) { const m = CSD(Number(a.flags["max-fee"])); if (Number.isSafeInteger(m) && m >= 0) return m; }
+  return Math.max(MAX_FEE_ABS, Math.floor(Math.max(0, txValue) * MAX_FEE_VALUE_FRACTION));
+}
+// Guard a value-write before it is built/signed. `txValue` = the value the user means to move
+// (recipients for a send; the fee itself for a fee-only propose/attest). Prints + returns false on abort.
+function feeSanity(fee: number, txValue: number, a: Args): boolean {
+  const cap = feeCap(txValue, a);
+  if (fee > cap) {
+    console.log(err(`fee ${csdToCoins(fee)} CSD looks abnormally high (cap ${csdToCoins(cap)} CSD).`) +
+      c.gray(" A proxy under-reporting your input can silently burn the difference as fee. Lower ") + c.cyan("--fee") +
+      c.gray(", or override with ") + c.cyan("--max-fee <CSD>") + c.gray(" if this is intentional."));
+    return false;
+  }
+  return true;
+}
+// Implied-fee transparency for a single-UTXO spend: the on-chain fee a hostile proxy can inflate is
+// (real input − value − change). We can only see the REPORTED input, but we can flag when the
+// reported change is implausibly small for the input (the collapsed-change signature of an
+// under-report). Non-fatal — a warning the user sees before they commit.
+function warnIfChangeCollapsed(inputValue: number, txValue: number, fee: number): void {
+  const change = inputValue - txValue - fee;
+  if (change < 0) return; // pickInput already ensures coverage; defensive
+  // a healthy spend leaves change ≫ fee unless the user genuinely picked a tight UTXO; flag the
+  // case where the implied fee dwarfs the change (what an under-reporting proxy produces).
+  if (change > 0 && fee > change * 4) {
+    console.log(warn(`heads up: change (${csdToCoins(change)} CSD) is much smaller than the fee (${csdToCoins(fee)} CSD).`) +
+      c.gray(" If your proxy under-reports this input, extra value is burned as fee — verify with your own node, or use ") + c.cyan("--max-fee") + c.gray("."));
+  }
+}
 // Resolve the user's PUBLIC address (to fetch inputs from the proxy). Never reads the key
 // unless we must derive it locally from the user's own csd wallet config (then we cache
 // only the public address). Order: --address → CAIRN_ADDR (both EXPLICIT user intent for this
@@ -298,7 +340,12 @@ async function cmdSend(a: Args) {
   console.log(`${kdim("from")}    ${c.cyan(addr)}`);
   for (const o of outs) console.log(`${kdim("to")}      ${c.cyan(o.to)} ${c.gray("→ " + csdToCoins(o.value) + " CSD")}`);
   console.log(`${kdim("fee")}     ${csdToCoins(fee)} CSD   ${kdim("total")} ${csdToCoins(total + fee)} CSD`);
+  // max-fee sanity: an absurd fee (typo, or a hostile proxy under-reporting the input → burned
+  // change) is refused BEFORE we build/sign. --dry-run still SHOWS the abnormal-fee warning (so the
+  // user sees it without spending) but never aborts the preview. --max-fee overrides a deliberate fee.
+  const feeOk = feeSanity(fee, total, a);
   if (a.flags["dry-run"]) { console.log(c.gray("\n[dry-run] not sent")); return; }
+  if (!feeOk) return;
   if (!(await freshTip(a))) return;
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(addr, total + fee).catch(() => null);
@@ -308,6 +355,7 @@ async function cmdSend(a: Args) {
   // (which would silently inflate the burned fee) is visible before we sign. Change goes to
   // your own address; the proxy can never redirect it.
   console.log(`${kdim("input")}   ${csdToCoins(picked.value)} CSD ${c.gray("(one UTXO)")}   ${kdim("change")} ${csdToCoins(Math.max(0, picked.value - total - fee))} CSD ${c.gray("back to you")}`);
+  warnIfChangeCollapsed(picked.value, total, fee);
   const sp2 = spinner("csd signs → submit");
   const args = ["spend"]; for (const o of outs) args.push("--output", `${o.to}:${o.value}`);
   args.push("--change", addr, "--fee", String(fee), "--input", picked.input);
@@ -355,13 +403,16 @@ async function cmdPropose(a: Args) {
     console.log(`${kdim("title")}    ${c.white(title)}`);
     console.log(`${kdim("hash")}     ${c.magenta(payloadHash)} ${c.gray("· uri " + uri)}`);
     console.log(`${kdim("fee")}      ${csdToCoins(fee)} CSD   ${kdim("from")} ${c.cyan(addr)}`);
+    feeSanity(fee, fee, a); // show the abnormal-fee warning in the preview (non-aborting on dry-run)
     console.log(c.gray("\n[dry-run] not signed or submitted"));
     return;
   }
+  if (!feeSanity(fee, fee, a)) return;
   if (!(await freshTip(a))) return;
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(addr, fee).catch(() => null);
   if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
+  warnIfChangeCollapsed(picked.value, 0, fee);
   const tip = await api.tipHeight().catch(() => 0);
   const days = Math.max(1, parseInt(String(a.flags["expires-days"] ?? 30)) || 30);
   const r = await signAndSubmit(["propose", "--domain", domain, "--payload-hash", payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", picked.input]);
@@ -392,13 +443,17 @@ async function cmdSupport(a: Args) {
   if (a.flags["dry-run"]) {
     console.log(`${kdim("support")}  ${c.cyan(id)}`);
     console.log(`${kdim("fee")}      ${csdToCoins(fee)} CSD ${c.gray("· score " + score + " · confidence " + confidence)}   ${kdim("from")} ${c.cyan(addr)}`);
+    feeSanity(fee, fee, a); // show the abnormal-fee warning in the preview (the attest weight IS the fee)
     console.log(c.gray("\n[dry-run] not signed or submitted"));
     return;
   }
+  // an attest's fee IS the deliberate weight/stake; only guard against an absurd typo above the cap.
+  if (!feeSanity(fee, fee, a)) return;
   if (!(await freshTip(a))) return;
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(addr, fee).catch(() => null);
   if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
+  warnIfChangeCollapsed(picked.value, 0, fee);
   const r = await signAndSubmit(["attest", "--proposal-id", id, "--score", String(score), "--confidence", String(confidence), "--fee", String(fee), "--change", addr, "--input", picked.input]);
   sp.stop();
   if (!r.ok) { console.log(err(r.error || "failed")); return; }
@@ -525,7 +580,7 @@ async function help() {
   console.log(c.bold("  wallet") + c.gray("  (signs with your installed csd wallet — cairn never holds your key)"));
   cmd("setup", "", "check csd + wallet, show your address (alias: doctor)");
   cmd("address", "", "your address + balance (alias: whoami, balance)");
-  cmd("send", "--to <0x…40> --amount <CSD>", "transfer CSD (+ --output <a>:<CSD> ×N, --fee <CSD>, --dry-run)");
+  cmd("send", "--to <0x…40> --amount <CSD>", "transfer CSD (+ --output <a>:<CSD> ×N, --fee <CSD>, --max-fee <CSD>, --dry-run)");
   cmd("propose", "--domain <d> --title <t> --body <b>", "post an item (alias: post; + --fee, --expires-days, --dry-run)");
   cmd("support", "<id> --fee <CSD>", "back an item (+ --score, --confidence, --dry-run)");
   console.log("");
@@ -578,10 +633,13 @@ async function main() {
 // Anchor a built registry record: Propose{domain, payloadHash} signed by the csd wallet,
 // then publish the EXACT canonical bytes to the content origin (self-certified on arrival).
 async function anchorRecord(rec: { domain: string; content: object; payloadHash: string }, addr: string, fee: number, days: number, label: string): Promise<boolean> {
+  // max-fee sanity: a fixed-floor record anchor should never burn more than the 1 CSD abs cap.
+  if (fee > MAX_FEE_ABS) { console.log(err(`fee ${csdToCoins(fee)} CSD looks abnormally high for a ${label} record (cap ${csdToCoins(MAX_FEE_ABS)} CSD).`) + c.gray(" Lower ") + c.cyan("--fee") + c.gray(".")); return false; }
   const uri = "csd:" + rec.domain.replace(/[^a-z]/gi, "").slice(0, 6) + ":v1:" + rec.payloadHash.slice(2, 14);
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(addr, fee).catch(() => null);
   if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return false; }
+  warnIfChangeCollapsed(picked.value, 0, fee);
   const tip = await api.tipHeight().catch(() => 0);
   const r = await signAndSubmit(["propose", "--domain", rec.domain, "--payload-hash", rec.payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", picked.input]);
   sp.stop();
@@ -765,9 +823,10 @@ async function cmdTokenSend(a: Args) {
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(from, CAIRNX_ANCHOR_FEE).catch(() => null);
   if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the 0.25 CSD anchor fee") + c.gray(" — fund " + from)); return; }
+  sp.stop(); warnIfChangeCollapsed(picked.value, 0, CAIRNX_ANCHOR_FEE); const sp3 = spinner("csd signs → submit");
   const tip = await api.tipHeight().catch(() => 0);
   const r = await signAndSubmit(["propose", "--domain", CAIRNX_DOMAIN, "--payload-hash", built.payloadHash, "--uri", built.uri, "--expires-epoch", String(Math.floor(tip / 30) + 24), "--fee", String(CAIRNX_ANCHOR_FEE), "--change", from, "--input", picked.input]);
-  sp.stop();
+  sp3.stop();
   console.log(r.ok ? ok(`transfer anchored  ${c.cyan(r.txid!)}`) + c.gray("  (tokens move when it mines — check `cairn tokens`)") : err(r.error || "failed"));
 }
 
