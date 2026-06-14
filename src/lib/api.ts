@@ -74,6 +74,37 @@ export async function confirmedBalance(addr: string): Promise<{ balance: number;
   return { balance: Number(j.confirmed_balance ?? 0), utxos: (j.utxos ?? []).length };
 }
 export async function tipHeight(): Promise<number> { return Number((await req("/api/rpc/tip")).height ?? 0); }
+// Chain-view freshness of the proxy's backend node: { stale, secondsSinceAdvance, staleSecsThreshold, height }.
+// Used to refuse building a tx against a frozen/forked tip. Throws if the surface is unreachable
+// (caller treats that as a soft warning, never a hard block — matches the 'cannot reach' UX).
+export async function rpcStatus(): Promise<{ stale?: boolean; secondsSinceAdvance?: number; staleSecsThreshold?: number; height?: number }> {
+  return req("/api/rpc/status");
+}
+// Look up a tx by id on the node. Mined txs resolve to { ok:true, txid, block_hash, height };
+// an unknown id resolves to { ok:false, err:"not found" }. (The node's /tx indexes MINED txs;
+// a mempool-only tx returns not-found, so a not-found is "no proof yet", never "rejected".)
+export async function txStatus(txid: string): Promise<{ ok: boolean; txid?: string; block_hash?: string | null; height?: number | null }> {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txid)) return { ok: false }; // never splice an unshaped id into the URL
+  const j = await req(`/api/rpc/tx/${encodeURIComponent(txid)}`).catch(() => null);
+  return j ?? { ok: false };
+}
+// Has the node confirmed OUR exact txid (mined into the chain)? Polls a few times because a
+// freshly-submitted tx is mempool-only until a block lands. Returns true ONLY on an exact
+// txid match the node reports as known — evidence the user's own tx (not a different conflict)
+// is on-chain. (Non-fatal on an unreachable node: simply never confirms.) The poll budget is
+// overridable via CAIRN_CONFIRM_ATTEMPTS / CAIRN_CONFIRM_INTERVAL_MS (used by the test suite).
+export async function confirmTxMined(
+  txid: string,
+  attempts = Number(process.env.CAIRN_CONFIRM_ATTEMPTS) || 4,
+  intervalMs = Number(process.env.CAIRN_CONFIRM_INTERVAL_MS) || 7000,
+): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    const s = await txStatus(txid).catch(() => null);
+    if (s?.ok && typeof s.txid === "string" && s.txid.toLowerCase() === txid.toLowerCase()) return true;
+    if (i < attempts - 1) await new Promise((res) => setTimeout(res, intervalMs));
+  }
+  return false;
+}
 // Submit a node-JSON tx through the proxy (for `csd spend`, which builds+signs but doesn't
 // reliably submit to a proxy URL). Returns the node's response.
 export async function submitTx(txNodeJson: unknown): Promise<any> { return req("/api/rpc/tx/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx: txNodeJson }) }); }

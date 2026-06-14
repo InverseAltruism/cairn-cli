@@ -15,17 +15,35 @@ import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, e
 const CSD = (n: number) => Number.isFinite(n) ? Math.round(n * CSD_PER_COIN) : NaN; // CSD → base units
 // Resolve the user's PUBLIC address (to fetch inputs from the proxy). Never reads the key
 // unless we must derive it locally from the user's own csd wallet config (then we cache
-// only the public address). Order: --address → CAIRN_ADDR → cached → derive via csd.
+// only the public address). Order: --address → CAIRN_ADDR (both EXPLICIT user intent for this
+// invocation) → the csd wallet's real change address → cached config.address (LAST, and never
+// above the wallet — see below).
+//
+// F13/R18: the cached config.address is attacker-tamperable (a poisoned
+// ~/.config/cairn-cli/config.json would otherwise redirect `cairn address` output, so a funder
+// piping it pays the attacker). So when csd is available we re-derive the wallet's REAL change
+// address and treat THAT as authoritative; if it disagrees with the cached value we refuse and
+// rewrite the cache. The cache is only used as a fallback when csd can't tell us the truth.
 async function resolveAddr(a: Args): Promise<string | null> {
-  const flag = a.flags.address ? String(a.flags.address) : (CAIRN_ADDR || loadLocalConfig().address);
-  if (flag && /^0x[0-9a-fA-F]{40}$/.test(flag)) return flag;
+  // explicit, per-invocation choice — the user can deliberately target any address
+  const explicit = a.flags.address ? String(a.flags.address) : CAIRN_ADDR;
+  if (explicit && /^0x[0-9a-fA-F]{40}$/.test(explicit)) return explicit;
+  const cached = loadLocalConfig().address;
   const cfg = await csd.walletConfig();
   // Prefer the address csd already exposes (change addr) — avoids re-deriving from the
   // privkey, which would put the key on the `csd` argv (visible via /proc on a shared host).
-  if (cfg?.default_change_addr20 && /^0x[0-9a-fA-F]{40}$/.test(String(cfg.default_change_addr20))) {
-    const addr = String(cfg.default_change_addr20); saveLocalConfig({ address: addr }); return addr;
+  let real: string | null = null;
+  if (cfg?.default_change_addr20 && /^0x[0-9a-fA-F]{40}$/.test(String(cfg.default_change_addr20))) real = String(cfg.default_change_addr20);
+  else if (cfg?.default_privkey) real = await csd.deriveAddr(cfg.default_privkey);
+  if (real && /^0x[0-9a-fA-F]{40}$/.test(real)) {
+    // the wallet is the source of truth — if the cached value was tampered to differ, say so
+    // loudly and overwrite the poisoned cache rather than silently trusting it.
+    if (cached && cached.toLowerCase() !== real.toLowerCase())
+      console.log(warn(`cached address ${c.cyan(san(cached))} does NOT match your csd wallet ${c.cyan(real)}`) + c.gray(" — using the wallet's address and refreshing the cache (a tampered config can't redirect you)."));
+    saveLocalConfig({ address: real }); return real;
   }
-  if (cfg?.default_privkey) { const addr = await csd.deriveAddr(cfg.default_privkey); if (addr) { saveLocalConfig({ address: addr }); return addr; } }
+  // csd couldn't tell us the truth → fall back to the cached public address (read-only use).
+  if (cached && /^0x[0-9a-fA-F]{40}$/.test(cached)) return cached;
   return null;
 }
 // Run a csd build/sign command (easy-path propose/attest/spend — they sign with the user's
@@ -33,9 +51,13 @@ async function resolveAddr(a: Args): Promise<string | null> {
 // proxy ourselves. We do NOT trust csd's own auto-submit: it targets csd's configured node,
 // which may be a different node than the one the Cairn board (and its miner) read — so a tx
 // could sit in the wrong mempool and never get mined into the board's view. Always submit via
-// the proxy (the board's miner-connected node). A repeat that comes back "already present /
-// known" for OUR txid is success (the tx is in that node's mempool); a true double-spend
-// "conflict" is the only ambiguous case, so we confirm via a tx lookup before claiming ok.
+// the proxy (the board's miner-connected node).
+//
+// Success is EVIDENCE-BASED, never message-based: a hostile proxy (or a real double-spend)
+// can return an "already present / conflict" string for a tx that is NOT actually ours, so we
+// never treat any error message as success. A clean submit ack is good; otherwise we ask the
+// node directly whether OUR exact txid is on-chain (api.confirmTxMined), and only claim success
+// when the node confirms it. If we can't confirm, we surface the real node message.
 async function signAndSubmit(csdArgs: string[]): Promise<{ ok: boolean; txid?: string; error?: string }> {
   const r = await csd.run(csdArgs);
   if (!r.ok) return { ok: false, error: (r.stderr || r.stdout || "csd failed").trim().split("\n").slice(-1)[0] };
@@ -44,15 +66,29 @@ async function signAndSubmit(csdArgs: string[]): Promise<{ ok: boolean; txid?: s
   const txid: string | undefined = out.txid;
   const sub = await api.submitTx(out.tx).catch((e: any) => ({ ok: false, err: e.message }));
   if (sub.ok) return { ok: true, txid: sub.txid || txid };
-  // A benign "already present / mempool conflict" for OUR txid means the tx is already in a
-  // mempool (e.g. csd's own auto-submit reached this same node first, or a re-run) — success.
-  // For a single-key wallet this is safe: only the key owner can produce a conflicting spend
-  // of their own UTXO, so a conflict on our freshly-built tx is our own prior submit, not a
-  // third party. (The narrow exception — two DIFFERENT local spends of one UTXO fired at once
-  // — is on the user.) The node can't be queried for mempool membership (its /tx indexes only
-  // mined txs), so we rely on the matching txid + benign message.
-  if (txid && /already|present|known|in mempool|conflict/i.test(String(sub.err ?? ""))) return { ok: true, txid };
+  // Submit was NOT acked. Don't trust the error STRING — a forged "already present" can hide a
+  // rejected/conflicting tx. Confirm against the chain: only if the node reports OUR exact txid
+  // as mined is this our own prior submit (a genuine "already in"); otherwise the conflict is a
+  // DIFFERENT spend (a real double-spend / hostile reply) and we surface it as a failure.
+  if (txid && await api.confirmTxMined(txid)) return { ok: true, txid };
   return { ok: false, error: sub.err || "submit rejected by node", txid };
+}
+// Freshness gate (R12): before building any value tx, consult the proxy's chain-view status so
+// we never sign against a FROZEN or forked tip (the proxy may be failing over to an honest-but-
+// stale or wedged node). Fail CLOSED on a stale tip; fail OPEN (warn only) if the freshness
+// surface is unreachable — that matches the rest of the CLI's 'cannot reach' UX and an old node
+// without /api/rpc/status must still be usable. `--force-stale` lets an operator override.
+async function freshTip(a: Args): Promise<boolean> {
+  let s: any;
+  try { s = await api.rpcStatus(); }
+  catch { console.log(warn("could not check chain freshness (status surface unreachable) — proceeding")); return true; }
+  const secs = Number(s?.secondsSinceAdvance ?? 0);
+  const threshold = Number(s?.staleSecsThreshold ?? 600);
+  const stale = s?.stale === true || (Number.isFinite(secs) && Number.isFinite(threshold) && threshold > 0 && secs > threshold);
+  if (!stale) return true;
+  if (a.flags["force-stale"]) { console.log(warn(`chain tip looks STALE (${secs}s since last advance) — proceeding anyway (--force-stale)`)); return true; }
+  console.log(err(`chain tip looks STALE — last advanced ${secs}s ago (threshold ${threshold}s).`) + c.gray(" The node may be frozen or failing over to a stale view; refusing to build a tx. Retry shortly, or override with ") + c.cyan("--force-stale") + c.gray("."));
+  return false;
 }
 // Guard: a write needs `csd` installed + a configured wallet (or an explicit --address + csd key).
 async function requireCsd(): Promise<boolean> {
@@ -78,10 +114,18 @@ function parse(argv: string[]): Args {
   }
   return { _, flags, multi };
 }
-// Do two URLs point at the same host? (used to refuse a "trustless" verify claim when the
-// node RPC and the board API are the same operator). Unparseable → treat as same (safe).
+// Do two URLs point at the same MACHINE? (used to refuse a "trustless" verify claim when the
+// node RPC and the board API are the same operator). Compares hostname only — NOT host — so a
+// same-box node:8789 + board:7777 are correctly judged same-machine (a port difference does not
+// make two endpoints independent), and canonicalizes the loopback aliases (127.0.0.1 / localhost
+// / ::1) so they all compare equal. Unparseable → treat as same (the SAFE default: never claim
+// trustless independence we can't establish).
+function canonHost(h: string): string {
+  const x = h.toLowerCase().replace(/^\[|\]$/g, ""); // strip IPv6 brackets
+  return (x === "localhost" || x === "127.0.0.1" || x === "::1" || x === "0.0.0.0") ? "localhost" : x;
+}
 function sameHost(a: string, b: string): boolean {
-  try { return new URL(a).host.toLowerCase() === new URL(b).host.toLowerCase(); } catch { return true; }
+  try { return canonHost(new URL(a).hostname) === canonHost(new URL(b).hostname); } catch { return true; }
 }
 const age = (sec: number) => {
   if (!sec) return "—";
@@ -255,6 +299,7 @@ async function cmdSend(a: Args) {
   for (const o of outs) console.log(`${kdim("to")}      ${c.cyan(o.to)} ${c.gray("→ " + csdToCoins(o.value) + " CSD")}`);
   console.log(`${kdim("fee")}     ${csdToCoins(fee)} CSD   ${kdim("total")} ${csdToCoins(total + fee)} CSD`);
   if (a.flags["dry-run"]) { console.log(c.gray("\n[dry-run] not sent")); return; }
+  if (!(await freshTip(a))) return;
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(addr, total + fee).catch(() => null);
   if (!picked) { sp.stop(); console.log(err("no single confirmed UTXO covers amount + fee") + c.gray(" — fund this address, or consolidate (a node + `csd … --auto-input` can combine inputs)")); return; }
@@ -267,7 +312,23 @@ async function cmdSend(a: Args) {
   const args = ["spend"]; for (const o of outs) args.push("--output", `${o.to}:${o.value}`);
   args.push("--change", addr, "--fee", String(fee), "--input", picked.input);
   const r = await signAndSubmit(args); sp2.stop();
-  console.log(r.ok ? ok(`sent  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)") : err(r.error || "failed"));
+  if (!r.ok) { console.log(err(r.error || "failed")); return; }
+  console.log(ok(`sent  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
+  await confirmMined(r.txid!, "transfer", !!a.flags.wait);
+}
+// Post-submit feedback for value writes (send/support). The txid is already proven submitted by the
+// evidence-based signAndSubmit; mining is a separate ~120s event, so by DEFAULT we DON'T block on it —
+// we report submitted + how to track it (matching token-send). Pass `--wait` to block until OUR exact
+// txid is mined (the old behavior; useful in scripts that chain on confirmation). Non-fatal either way.
+async function confirmMined(txid: string, label: string, wait: boolean) {
+  if (!wait) {
+    console.log(c.gray(`  ${label} submitted — usually mines within ~2 min; track with `) + c.cyan(`cairn show ${txid.slice(0, 10)}…`));
+    return;
+  }
+  const sp = spinner("waiting for the tx to mine (--wait)");
+  const mined = await api.confirmTxMined(txid).catch(() => false);
+  sp.stop();
+  console.log(mined ? ok(`${label} confirmed on-chain`) : warn(`${label} submitted — not mined yet; re-check with `) + c.cyan(`cairn show`) + warn(" once a block lands"));
 }
 
 async function cmdPropose(a: Args) {
@@ -297,6 +358,7 @@ async function cmdPropose(a: Args) {
     console.log(c.gray("\n[dry-run] not signed or submitted"));
     return;
   }
+  if (!(await freshTip(a))) return;
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(addr, fee).catch(() => null);
   if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
@@ -333,12 +395,15 @@ async function cmdSupport(a: Args) {
     console.log(c.gray("\n[dry-run] not signed or submitted"));
     return;
   }
+  if (!(await freshTip(a))) return;
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(addr, fee).catch(() => null);
   if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
   const r = await signAndSubmit(["attest", "--proposal-id", id, "--score", String(score), "--confidence", String(confidence), "--fee", String(fee), "--change", addr, "--input", picked.input]);
   sp.stop();
-  console.log(r.ok ? ok(`supported  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)") : err(r.error || "failed"));
+  if (!r.ok) { console.log(err(r.error || "failed")); return; }
+  console.log(ok(`supported  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
+  await confirmMined(r.txid!, "support", !!a.flags.wait);
 }
 
 async function cmdWall(a: Args) {
@@ -696,6 +761,7 @@ async function cmdTokenSend(a: Args) {
   if (a.flags["dry-run"]) { console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
   if (!(await requireCsd())) return;
   if (!a.flags.yes && !(await confirmSend(`\nsend ${tokAmt(amount.toString(), t.decimals)} ${ticker} for ${csdToCoins(CAIRNX_ANCHOR_FEE)} CSD? [y/N] `))) { console.log(c.gray("aborted")); return; }
+  if (!(await freshTip(a))) return;
   const sp = spinner("fetching input → csd signs → submit");
   const picked = await api.pickInput(from, CAIRNX_ANCHOR_FEE).catch(() => null);
   if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the 0.25 CSD anchor fee") + c.gray(" — fund " + from)); return; }
