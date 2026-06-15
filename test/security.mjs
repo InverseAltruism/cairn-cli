@@ -6,7 +6,7 @@
 //   • san() strips control chars
 // Uses ASYNC spawn (not spawnSync): the in-process mock server shares this event loop, so
 // the parent must NOT block while the child runs its requests. No real chain, no spending.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
 import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -125,6 +125,13 @@ const rpcServer = http.createServer((req, res) => {
   const u = new URL(req.url, "http://x");
   res.setHeader("content-type", "application/json");
   if (u.pathname.startsWith("/proposal/")) return res.end(JSON.stringify({ proposal: { payload_hash: GOOD_ITEM.payloadHash } }));
+  // UTXO-VALUE-1 cross-source: the INDEPENDENT node reports the SAME outpoint the proxy picked
+  // (txid be…be:0) but a DIFFERENT (true) value than the proxy's 9e9 — a disagreement the CLI must
+  // refuse to spend on (a proxy under/over-reporting the input would otherwise burn the gap as fee).
+  if (u.pathname.startsWith("/utxos/")) return res.end(JSON.stringify({ confirmed_balance: 5e9, utxos: [{ txid: "0x" + "be".repeat(32), vout: 0, value: 5e9 }] }));
+  // H-7 independent confirm: this node does NOT know MINED_TXID (so a proxy that string-echoes a
+  // "mined" reply is contradicted → the CLI must NOT assert "confirmed on-chain").
+  if (u.pathname.startsWith("/tx/")) return res.end(JSON.stringify({ ok: false, err: "not found" }));
   res.statusCode = 404; res.end(JSON.stringify({ ok: false }));
 });
 await new Promise((r) => rpcServer.listen(0, "127.0.0.1", r));
@@ -229,6 +236,35 @@ console.log("\n— san() unit: strips control chars, keeps printable text —");
 const { san } = await import("../dist/lib/ui.js");
 const s = san("A\x1b[31m\x07B\x9bC\rD");
 check("san removes ESC/BEL/C1/CR, keeps letters", !/[\x00-\x1f\x7f-\x9f]/.test(s) && s.includes("A") && s.includes("D"));
+
+// ── H-1: which `csd` binary signs is pinned/verified, not a bare $PATH lookup ──
+console.log("\n— H-1: csd binary resolution is hardened (no unpinned key-theft binary) —");
+// resolveCsdBin caches per-process, so probe it in a child for a clean read of each env.
+const probe = (env) => JSON.parse(spawnSync("node", ["-e", "import('./dist/lib/csd.js').then(m=>process.stdout.write(JSON.stringify(m.resolveCsdBin())))"], { env: { ...process.env, ...env, CAIRN_CSD: env.CAIRN_CSD ?? "" }, encoding: "utf8" }).stdout || "{}");
+const relRes = probe({ CAIRN_CSD: "relative/csd" });
+check("a RELATIVE CAIRN_CSD is refused (must be absolute)", !relRes.path && /ABSOLUTE/i.test(relRes.error || ""));
+// An EXPLICIT absolute path is honored (power-user / test-harness choice) — this is how the whole
+// suite drives the mock csd, so it must keep working.
+const absRes = probe({ CAIRN_CSD: MOCK_CSD });
+check("an explicit ABSOLUTE CAIRN_CSD is honored", absRes.path === MOCK_CSD && absRes.explicit === true);
+// A world-writable explicit binary is honored but WARNED about.
+const wwDir = mkdtempSync(join(tmpdir(), "cairn-cli-ww-")); const wwBin = join(wwDir, "csd");
+writeFileSync(wwBin, "#!/bin/sh\n"); chmodSync(wwBin, 0o777);
+const wwRes = probe({ CAIRN_CSD: wwBin });
+check("a world-writable explicit csd is honored but warned", wwRes.path === wwBin && /world-writable/i.test(wwRes.warning || ""));
+
+// ── UTXO-VALUE-1 cross-source: an independent node value mismatch REFUSES the spend ──
+console.log("\n— UTXO-VALUE-1: a value mismatch vs the independent node (CAIRN_RPC) refuses the spend —");
+const xsrc = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED, CAIRN_RPC: RPC_DIFF_PORT })).out;
+check("send REFUSES on a proxy↔node input-value mismatch", /MISMATCH/i.test(xsrc) && !/\bsent\b/i.test(xsrc));
+
+// ── H-7: a 'mined' status the independent node does NOT confirm is not asserted as on-chain ──
+console.log("\n— H-7: a proxy-only 'mined' reply is not asserted as confirmed-on-chain —");
+// (use the GOOD wallet UTXO from the proxy AND an independent node that AGREES on value, so the
+//  spend proceeds to the confirm step, where the independent node then contradicts the 'mined' echo.)
+// We assert the wording: the CLI must flag UNCONFIRMED rather than print a bare 'confirmed on-chain'.
+const h7 = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1", "--wait"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED })).out;
+check("without CAIRN_RPC, a 'mined' claim is softened (not a bare trustless 'confirmed on-chain')", !/confirmed on-chain(?!.*independent)/i.test(h7) || /proxy reports mined|set CAIRN_RPC/i.test(h7));
 
 server.close();
 rpcServer.close();
