@@ -69,6 +69,31 @@ export async function pickInput(addr: string, minValue: number): Promise<{ input
   const x = cand[0] ?? (j.utxos ?? []).find(ok);
   return x ? { input: `${x.txid}:${Number(x.vout)}:${Number(x.value)}`, value: Number(x.value) } : null;
 }
+// UTXO-VALUE-1 cross-source check. cairn-cli has no codec to recompute an input's REAL value, so
+// a hostile/MITM'd CAIRN_API that UNDER-reports a UTXO's value would make `csd` compute too-small
+// a change and silently burn the difference as fee. If the user has configured an INDEPENDENT node
+// (CAIRN_RPC, a different host than the proxy), confirm the picked outpoint's value against its
+// authoritative UTXO set and refuse on a mismatch. Returns:
+//   { checked:false }                          — no independent RPC configured / unreachable (caller warns + relies on the fee cap)
+//   { checked:true, ok:true,  value }          — independent node agrees (display the verified value)
+//   { checked:true, ok:false, value }          — DISAGREEMENT (hostile proxy) → caller refuses
+//   { checked:true, ok:false, missing:true }   — outpoint absent on the independent node → suspicious, caller refuses
+export async function verifyInputValue(addr: string, txid: string, vout: number, claimedValue: number): Promise<{ checked: boolean; ok?: boolean; value?: number; missing?: boolean }> {
+  if (!CAIRN_RPC) return { checked: false };
+  if (!/^0x[0-9a-fA-F]{40}$/.test(addr) || !HEX64.test(txid)) return { checked: false };
+  let j: any;
+  try {
+    const r = await fetch(`${CAIRN_RPC}/utxos/${encodeURIComponent(addr)}`, { redirect: "error", signal: AbortSignal.timeout(6000) });
+    if (!r.ok) return { checked: false };
+    j = await r.json();
+  } catch { return { checked: false }; }
+  const list = j.utxos ?? j.outputs ?? [];
+  const norm = (t: string) => String(t).toLowerCase().replace(/^0x/, "");
+  const hit = list.find((u: any) => norm(u.txid) === norm(txid) && Number(u.vout) === vout);
+  if (!hit) return { checked: true, ok: false, missing: true };
+  const v = Number(hit.value);
+  return { checked: true, ok: Number.isSafeInteger(v) && v === claimedValue, value: v };
+}
 export async function confirmedBalance(addr: string): Promise<{ balance: number; utxos: number }> {
   const j = await req(`/api/rpc/utxos-all/${encodeURIComponent(addr)}`);
   return { balance: Number(j.confirmed_balance ?? 0), utxos: (j.utxos ?? []).length };
@@ -127,6 +152,22 @@ export async function registerRawContent(bytes: string, txid: string, attempts =
   return false;
 }
 
+// Independent confirmation (audit H-7): is this txid mined according to CAIRN_RPC, a node on a
+// DIFFERENT host than the proxy? `confirmTxMined` above polls the proxy's own /api/rpc/tx, which a
+// hostile/MITM'd CAIRN_API can string-echo to forge a "mined" reply. This cross-checks an
+// independent node. Returns true (independent node confirms OUR exact txid mined), false (it does
+// not), or null (no independent RPC configured / unreachable → "unverifiable", never a hard claim).
+export async function chainTxMined(txid: string): Promise<boolean | null> {
+  if (!CAIRN_RPC) return null;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txid)) return null;
+  try {
+    const r = await fetch(`${CAIRN_RPC}/tx/${encodeURIComponent(txid)}`, { redirect: "error", signal: AbortSignal.timeout(6000) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const t = String(j.txid ?? j.tx?.txid ?? "").toLowerCase().replace(/^0x/, "");
+    return j.ok === true && t === txid.toLowerCase().replace(/^0x/, "");
+  } catch { return null; }
+}
 // optional: query a raw csd node RPC (for trustless verify)
 export async function chainProposal(id: string): Promise<any | null> {
   if (!CAIRN_RPC) return null;

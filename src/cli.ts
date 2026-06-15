@@ -55,6 +55,31 @@ function warnIfChangeCollapsed(inputValue: number, txValue: number, fee: number)
       c.gray(" If your proxy under-reports this input, extra value is burned as fee — verify with your own node, or use ") + c.cyan("--max-fee") + c.gray("."));
   }
 }
+// Pick a spendable input from the proxy, INDEPENDENTLY verify its value against CAIRN_RPC
+// (UTXO-VALUE-1 cross-source cure), and ALWAYS display the input/change so the implied fee is
+// visible on EVERY write (not just `send`). `txValue` = value moved to recipients (0 for a fee-
+// only propose/attest); `fee` = the fee. Returns the csd input triple, or null (reason printed).
+// Defense layering: (1) if an independent node is configured we cryptographically catch an
+// under-report and REFUSE; (2) otherwise the value is proxy-trusted and the only backstop is the
+// feeSanity cap + the visible change line — the user is told to set CAIRN_RPC for a real check.
+async function pickAndShow(addr: string, need: number, txValue: number, fee: number): Promise<string | null> {
+  const picked = await api.pickInput(addr, need).catch(() => null);
+  if (!picked) { console.log(err("no single confirmed UTXO covers this spend") + c.gray(" — fund this address, or consolidate (a node + `csd … --auto-input` can combine inputs).")); return null; }
+  const [ptxid, pvoutS] = picked.input.split(":");
+  const v = await api.verifyInputValue(addr, ptxid, Number(pvoutS), picked.value).catch(() => ({ checked: false as boolean }));
+  if ((v as any).checked && (v as any).ok === false) {
+    if ((v as any).missing) console.log(err("the picked input is NOT in your independent node's UTXO set (CAIRN_RPC).") + c.gray(" The proxy may be misreporting your coins — refusing to spend. Check your node is synced, or unset CAIRN_RPC to override."));
+    else console.log(err(`input value MISMATCH — proxy says ${csdToCoins(picked.value)} CSD, your node says ${csdToCoins((v as any).value ?? 0)} CSD.`) + c.gray(" A proxy under-reporting your input would burn the difference as fee — refusing to spend."));
+    return null;
+  }
+  const verified = (v as any).checked && (v as any).ok === true;
+  const inputValue = verified ? Number((v as any).value) : picked.value;
+  const tag = verified ? c.green(" ✓ verified vs your node")
+            : (CAIRN_RPC ? c.gray(" (independent value check unavailable)") : c.gray(" (set CAIRN_RPC to your own node to independently verify this value)"));
+  console.log(`${kdim("input")}   ${csdToCoins(inputValue)} CSD ${c.gray("(one UTXO)")}${tag}   ${kdim("change")} ${csdToCoins(Math.max(0, inputValue - txValue - fee))} CSD ${c.gray("back to you")}`);
+  warnIfChangeCollapsed(inputValue, txValue, fee);
+  return picked.input;
+}
 // Resolve the user's PUBLIC address (to fetch inputs from the proxy). Never reads the key
 // unless we must derive it locally from the user's own csd wallet config (then we cache
 // only the public address). Order: --address → CAIRN_ADDR (both EXPLICIT user intent for this
@@ -72,20 +97,28 @@ async function resolveAddr(a: Args): Promise<string | null> {
   if (explicit && /^0x[0-9a-fA-F]{40}$/.test(explicit)) return explicit;
   const cached = loadLocalConfig().address;
   const cfg = await csd.walletConfig();
-  // Prefer the address csd already exposes (change addr) — avoids re-deriving from the
-  // privkey, which would put the key on the `csd` argv (visible via /proc on a shared host).
-  let real: string | null = null;
-  if (cfg?.default_change_addr20 && /^0x[0-9a-fA-F]{40}$/.test(String(cfg.default_change_addr20))) real = String(cfg.default_change_addr20);
-  else if (cfg?.default_privkey) real = await csd.deriveAddr(cfg.default_privkey);
-  if (real && /^0x[0-9a-fA-F]{40}$/.test(real)) {
-    // the wallet is the source of truth — if the cached value was tampered to differ, say so
-    // loudly and overwrite the poisoned cache rather than silently trusting it.
+  // Best case: the wallet exposes its change address directly — authoritative AND needs no key
+  // (no argv exposure). The cache is then only an anti-poison cross-check (F13/R18): if a tampered
+  // config disagrees, say so loudly and use the wallet's address.
+  if (cfg?.default_change_addr20 && /^0x[0-9a-fA-F]{40}$/.test(String(cfg.default_change_addr20))) {
+    const real = String(cfg.default_change_addr20);
     if (cached && cached.toLowerCase() !== real.toLowerCase())
       console.log(warn(`cached address ${c.cyan(san(cached))} does NOT match your csd wallet ${c.cyan(real)}`) + c.gray(" — using the wallet's address and refreshing the cache (a tampered config can't redirect you)."));
     saveLocalConfig({ address: real }); return real;
   }
-  // csd couldn't tell us the truth → fall back to the cached public address (read-only use).
+  // No change address configured. Audit H-2: re-deriving from the privkey on EVERY call runs
+  // `csd wallet recover --privkey <KEY>`, putting the key on the argv (readable via /proc on a
+  // shared host). Avoid that — prefer a previously-cached address; only DERIVE when we have
+  // nothing else (then cache it + warn once, and nudge the user to set a change address so the
+  // key is never needed again, which also restores the F13 anti-poison cross-check above).
   if (cached && /^0x[0-9a-fA-F]{40}$/.test(cached)) return cached;
+  if (cfg?.default_privkey) {
+    const real = await csd.deriveAddr(cfg.default_privkey);
+    if (real && /^0x[0-9a-fA-F]{40}$/.test(real)) {
+      console.log(warn("derived your address from the wallet key once.") + c.gray(" " + csd.keyExposureWarning));
+      saveLocalConfig({ address: real }); return real;
+    }
+  }
   return null;
 }
 // Run a csd build/sign command (easy-path propose/attest/spend — they sign with the user's
@@ -298,7 +331,11 @@ async function cmdVerify(a: Args) {
 async function cmdSetup() {
   banner(); rule("setup — cairn over your csd wallet");
   const has = await csd.available();
-  console.log(`  ${kdim("csd binary")}  ${has ? ok("found (" + csd.CSD_BIN + ")") : err("not found — install Compute Substrate's csd CLI, or set CAIRN_CSD to its path")}`);
+  // H-1: show the RESOLVED absolute path of the binary that will SIGN, so the user can verify it
+  // (and see the refusal if it was resolved from an untrusted location).
+  const bin = csd.csdPathInfo();
+  console.log(`  ${kdim("csd binary")}  ${has ? ok("found") + c.gray("  " + (bin.path ?? "")) + (bin.explicit ? c.gray("  (CAIRN_CSD)") : c.gray("  (resolved)")) : err(bin.error || "not found — install Compute Substrate's csd CLI, or set CAIRN_CSD to its absolute path")}`);
+  if (bin.warning) console.log(`  ${kdim("")}            ${warn(bin.warning)}`);
   if (!has) { console.log(c.gray("\n  cairn signs nothing itself — it drives your csd wallet. Install csd, then re-run ") + c.cyan("cairn setup") + c.gray(".")); return; }
   const cfg = await csd.walletConfig();
   console.log(`  ${kdim("csd wallet")}  ${cfg?.default_privkey ? ok("key configured") : warn("no key — run ") + c.cyan("csd wallet new") + c.gray(" then ") + c.cyan("csd wallet init --privkey <key>")}`);
@@ -347,18 +384,11 @@ async function cmdSend(a: Args) {
   if (a.flags["dry-run"]) { console.log(c.gray("\n[dry-run] not sent")); return; }
   if (!feeOk) return;
   if (!(await freshTip(a))) return;
-  const sp = spinner("fetching input → csd signs → submit");
-  const picked = await api.pickInput(addr, total + fee).catch(() => null);
-  if (!picked) { sp.stop(); console.log(err("no single confirmed UTXO covers amount + fee") + c.gray(" — fund this address, or consolidate (a node + `csd … --auto-input` can combine inputs)")); return; }
-  sp.stop();
-  // transparency: show the input value + change so a hostile proxy under-reporting the input
-  // (which would silently inflate the burned fee) is visible before we sign. Change goes to
-  // your own address; the proxy can never redirect it.
-  console.log(`${kdim("input")}   ${csdToCoins(picked.value)} CSD ${c.gray("(one UTXO)")}   ${kdim("change")} ${csdToCoins(Math.max(0, picked.value - total - fee))} CSD ${c.gray("back to you")}`);
-  warnIfChangeCollapsed(picked.value, total, fee);
+  const input = await pickAndShow(addr, total + fee, total, fee);
+  if (!input) return;
   const sp2 = spinner("csd signs → submit");
   const args = ["spend"]; for (const o of outs) args.push("--output", `${o.to}:${o.value}`);
-  args.push("--change", addr, "--fee", String(fee), "--input", picked.input);
+  args.push("--change", addr, "--fee", String(fee), "--input", input);
   const r = await signAndSubmit(args); sp2.stop();
   if (!r.ok) { console.log(err(r.error || "failed")); return; }
   console.log(ok(`sent  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
@@ -375,8 +405,15 @@ async function confirmMined(txid: string, label: string, wait: boolean) {
   }
   const sp = spinner("waiting for the tx to mine (--wait)");
   const mined = await api.confirmTxMined(txid).catch(() => false);
+  // H-7: the proxy can string-echo a "mined" reply. Only assert "confirmed on-chain" when an
+  // INDEPENDENT node (CAIRN_RPC) agrees; otherwise soften/flag so the user isn't given a false
+  // settlement guarantee they might release goods against.
+  const indep = mined ? await api.chainTxMined(txid).catch(() => null) : null;
   sp.stop();
-  console.log(mined ? ok(`${label} confirmed on-chain`) : warn(`${label} submitted — not mined yet; re-check with `) + c.cyan(`cairn show`) + warn(" once a block lands"));
+  if (!mined) { console.log(warn(`${label} submitted — not mined yet; re-check with `) + c.cyan(`cairn show`) + warn(" once a block lands")); return; }
+  if (indep === true) console.log(ok(`${label} confirmed on-chain`) + c.gray("  (verified against your independent node)"));
+  else if (indep === false) console.log(err(`${label}: the proxy reports it mined but your node (CAIRN_RPC) does NOT — treat as UNCONFIRMED.`) + c.gray(" A hostile proxy can forge a 'mined' reply; trust your own node."));
+  else console.log(warn(`${label}: proxy reports mined`) + c.gray("  — set CAIRN_RPC to your own node to confirm independently (a proxy can forge this signal)."));
 }
 
 async function cmdPropose(a: Args) {
@@ -409,13 +446,12 @@ async function cmdPropose(a: Args) {
   }
   if (!feeSanity(fee, fee, a)) return;
   if (!(await freshTip(a))) return;
-  const sp = spinner("fetching input → csd signs → submit");
-  const picked = await api.pickInput(addr, fee).catch(() => null);
-  if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
-  warnIfChangeCollapsed(picked.value, 0, fee);
+  const input = await pickAndShow(addr, fee, 0, fee);
+  if (!input) return;
   const tip = await api.tipHeight().catch(() => 0);
   const days = Math.max(1, parseInt(String(a.flags["expires-days"] ?? 30)) || 30);
-  const r = await signAndSubmit(["propose", "--domain", domain, "--payload-hash", payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", picked.input]);
+  const sp = spinner("csd signs → submit");
+  const r = await signAndSubmit(["propose", "--domain", domain, "--payload-hash", payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", input]);
   sp.stop();
   if (!r.ok) { console.log(err(r.error || "failed")); return; }
   console.log(ok(`proposed  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
@@ -450,11 +486,10 @@ async function cmdSupport(a: Args) {
   // an attest's fee IS the deliberate weight/stake; only guard against an absurd typo above the cap.
   if (!feeSanity(fee, fee, a)) return;
   if (!(await freshTip(a))) return;
-  const sp = spinner("fetching input → csd signs → submit");
-  const picked = await api.pickInput(addr, fee).catch(() => null);
-  if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return; }
-  warnIfChangeCollapsed(picked.value, 0, fee);
-  const r = await signAndSubmit(["attest", "--proposal-id", id, "--score", String(score), "--confidence", String(confidence), "--fee", String(fee), "--change", addr, "--input", picked.input]);
+  const input = await pickAndShow(addr, fee, 0, fee);
+  if (!input) return;
+  const sp = spinner("csd signs → submit");
+  const r = await signAndSubmit(["attest", "--proposal-id", id, "--score", String(score), "--confidence", String(confidence), "--fee", String(fee), "--change", addr, "--input", input]);
   sp.stop();
   if (!r.ok) { console.log(err(r.error || "failed")); return; }
   console.log(ok(`supported  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
@@ -636,12 +671,11 @@ async function anchorRecord(rec: { domain: string; content: object; payloadHash:
   // max-fee sanity: a fixed-floor record anchor should never burn more than the 1 CSD abs cap.
   if (fee > MAX_FEE_ABS) { console.log(err(`fee ${csdToCoins(fee)} CSD looks abnormally high for a ${label} record (cap ${csdToCoins(MAX_FEE_ABS)} CSD).`) + c.gray(" Lower ") + c.cyan("--fee") + c.gray(".")); return false; }
   const uri = "csd:" + rec.domain.replace(/[^a-z]/gi, "").slice(0, 6) + ":v1:" + rec.payloadHash.slice(2, 14);
-  const sp = spinner("fetching input → csd signs → submit");
-  const picked = await api.pickInput(addr, fee).catch(() => null);
-  if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the fee") + c.gray(" — fund " + addr)); return false; }
-  warnIfChangeCollapsed(picked.value, 0, fee);
+  const input = await pickAndShow(addr, fee, 0, fee);
+  if (!input) return false;
   const tip = await api.tipHeight().catch(() => 0);
-  const r = await signAndSubmit(["propose", "--domain", rec.domain, "--payload-hash", rec.payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", picked.input]);
+  const sp = spinner("csd signs → submit");
+  const r = await signAndSubmit(["propose", "--domain", rec.domain, "--payload-hash", rec.payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", input]);
   sp.stop();
   if (!r.ok) { console.log(err(r.error || "failed")); return false; }
   console.log(ok(`${label} anchored  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
@@ -820,12 +854,11 @@ async function cmdTokenSend(a: Args) {
   if (!(await requireCsd())) return;
   if (!a.flags.yes && !(await confirmSend(`\nsend ${tokAmt(amount.toString(), t.decimals)} ${ticker} for ${csdToCoins(CAIRNX_ANCHOR_FEE)} CSD? [y/N] `))) { console.log(c.gray("aborted")); return; }
   if (!(await freshTip(a))) return;
-  const sp = spinner("fetching input → csd signs → submit");
-  const picked = await api.pickInput(from, CAIRNX_ANCHOR_FEE).catch(() => null);
-  if (!picked) { sp.stop(); console.log(err("no confirmed UTXO above the 0.25 CSD anchor fee") + c.gray(" — fund " + from)); return; }
-  sp.stop(); warnIfChangeCollapsed(picked.value, 0, CAIRNX_ANCHOR_FEE); const sp3 = spinner("csd signs → submit");
+  const input = await pickAndShow(from, CAIRNX_ANCHOR_FEE, 0, CAIRNX_ANCHOR_FEE);
+  if (!input) return;
   const tip = await api.tipHeight().catch(() => 0);
-  const r = await signAndSubmit(["propose", "--domain", CAIRNX_DOMAIN, "--payload-hash", built.payloadHash, "--uri", built.uri, "--expires-epoch", String(Math.floor(tip / 30) + 24), "--fee", String(CAIRNX_ANCHOR_FEE), "--change", from, "--input", picked.input]);
+  const sp3 = spinner("csd signs → submit");
+  const r = await signAndSubmit(["propose", "--domain", CAIRNX_DOMAIN, "--payload-hash", built.payloadHash, "--uri", built.uri, "--expires-epoch", String(Math.floor(tip / 30) + 24), "--fee", String(CAIRNX_ANCHOR_FEE), "--change", from, "--input", input]);
   sp3.stop();
   console.log(r.ok ? ok(`transfer anchored  ${c.cyan(r.txid!)}`) + c.gray("  (tokens move when it mines — check `cairn tokens`)") : err(r.error || "failed"));
 }
