@@ -154,7 +154,7 @@ const dry = await run(["token-send", "--ticker", "CAIRN", "--to", YOU, "--amount
 check("prints the EXACT canonical record uri", dry.out.includes(`{"amount":"150000000","t":"transfer","ticker":"CAIRN","to":"${YOU}","v":1}`));
 check("prints the record's sha256 payload hash", /hash\s+0x[0-9a-f]{64}/.test(dry.out));
 check("prints the 0.25 CSD anchor cost", /0\.25 CSD/.test(dry.out));
-check("prints human + base units + decimals", /1\.5 CAIRN \(150000000 base units · 8 decimals\)/.test(dry.out));
+check("prints human + base units + decimals", /1\.5 CAIRN/.test(dry.out) && /150000000 base units · 8 decimals/.test(dry.out));
 check("ends in [dry-run], exit 0, csd never touched", /\[dry-run\] not signed or submitted/.test(dry.out) && dry.code === 0 && !/csd/.test(dry.out.split("record")[0]));
 check("uppercases a lowercase --ticker", (await run(["token-send", "--ticker", "cairn", "--to", YOU, "--amount", "1", "--address", ME, "--dry-run"], env)).out.includes('"ticker":"CAIRN"'));
 const frac0 = await run(["token-send", "--ticker", "DEC0", "--to", YOU, "--amount", "1.5", "--address", ME, "--dry-run"], env);

@@ -38,7 +38,10 @@ function insecureReason(abs: string): string | null {
   const dir = dirname(abs);
   try {
     const dst = statSync(dir);
-    if ((dst.mode & 0o002) && !(dst.mode & 0o1000)) return `is in a world-writable directory (${dir})`;
+    // CLI-C2-STICKY: a trusted signing binary must never live in a world-writable directory —
+    // the sticky bit stops OTHER users deleting your file, but the dir's owner (the attacker, if
+    // they own the planted binary) is unaffected, so do NOT exempt sticky 1777 dirs from the check.
+    if (dst.mode & 0o002) return `is in a world-writable directory (${dir})`;
   } catch { /* dir unreadable — fall through */ }
   if (dir === process.cwd()) return "is in the current working directory (a cwd hijack vector)";
   if (dir.startsWith("/tmp") || dir.startsWith("/var/tmp") || dir.startsWith("/dev/shm")) return `is in a transient directory (${dir})`;
@@ -65,13 +68,24 @@ export function resolveCsdBin(): { path: string | null; warning?: string; error?
     // bespoke absolute paths deliberately.
     if (!isAbsolute(env)) return (_resolved = { path: null, explicit: true, error: `CAIRN_CSD must be an ABSOLUTE path (got "${env}") — a relative csd binary is a key-theft risk` });
     let abs = env; try { abs = realpathSync(env); } catch { /* may legitimately not exist yet — surfaced at run/available */ }
+    // CLI-C2-EXPLICIT-DIR: warn (don't refuse — it's the user's explicit choice) on ANY insecurity
+    // of the resolved path, not just a world-writable FILE: a world-writable / transient / cwd
+    // DIRECTORY is just as plantable. "does not exist" is normal (surfaced later), so skip it.
     let warning: string | undefined;
-    try { if (statSync(abs).mode & 0o002) warning = `CAIRN_CSD (${abs}) is world-writable — anyone could replace it with a key-stealing binary`; } catch { /* */ }
+    const reason = insecureReason(abs);
+    if (reason && reason !== "does not exist") warning = `CAIRN_CSD (${abs}) ${reason} — anyone could replace it with a key-stealing binary`;
     return (_resolved = { path: abs, explicit: true, warning });
   }
   // Implicit resolution: canonical locations first (defeats PATH-order hijack), then PATH.
   for (const cand of CANONICAL) {
-    try { const st = statSync(cand); if (st.isFile() && (st.mode & 0o111) && !insecureReason(cand)) return (_resolved = { path: realpathSync(cand), explicit: false }); } catch { /* next */ }
+    // CLI-C2-SYMLINK-TOCTOU: resolve the symlink FIRST, then run the security check on the REAL
+    // target (insecureReason on a symlink validates the link's parent dir, not the target's) — so a
+    // canonical-path symlink can't point at a world-writable binary that slips the check.
+    try {
+      const st = statSync(cand); if (!st.isFile() || !(st.mode & 0o111)) continue;
+      const real = realpathSync(cand);
+      if (!insecureReason(real)) return (_resolved = { path: real, explicit: false });
+    } catch { /* next */ }
   }
   const found = pathSearch("csd");
   if (!found) return (_resolved = { path: null, explicit: false, error: "`csd` not found in any trusted location or on PATH — install it, or set CAIRN_CSD to its absolute path" });

@@ -70,12 +70,20 @@ export function csd(base: number): string {
   return c.green(`${(base / 1e8).toLocaleString(undefined, { maximumFractionDigits: 4 })}`) + c.gray(" CSD");
 }
 
-// Strip C0/C1 control chars (incl. ESC) from UNTRUSTED strings before printing them to a
-// TTY, so a hostile server/chain field (title, body, message, handle, bio, domain, id…)
-// can't inject ANSI/OSC escapes to spoof output — e.g. cursor-up + repaint to overwrite a
-// "✗ MISMATCH" verdict with "✓ VERIFIED", rewrite the window title, or hijack the terminal.
-// Display-only: NEVER apply to bytes that get hashed/verified (it would change the hash).
-const CTRL = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f]", "g");
+// Strip dangerous characters from UNTRUSTED strings before printing them to a TTY, so a
+// hostile server/chain field (title, body, message, ERROR string, txid/id, handle, bio,
+// domain…) can't (a) inject ANSI/OSC escapes to spoof output — cursor-up + repaint to
+// overwrite a "✗ MISMATCH" with "✓ VERIFIED", rewrite the window title, OSC-8 link spoof,
+// OSC-52 clipboard write — or (b) use Unicode bidi-overrides / zero-width chars to spoof
+// a displayed address/name/amount (CLI-9). Display-only: NEVER apply to bytes that get
+// hashed/verified (it would change the hash).
+//   • C0/C1 control + DEL (incl. ESC 0x1b — the ANSI/OSC lead-in)
+//   • bidi controls: LRM/RLM U+200E/F, ALM U+061C, LRE..RLO U+202A-E, LRI..PDI U+2066-9
+//   • zero-width / joiners / BOM: ZWSP/ZWNJ/ZWJ U+200B-D, WJ U+2060, BOM U+FEFF
+const CTRL = new RegExp(
+  "[\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200b-\\u200f\\u2060\\u2066-\\u2069\\u202a-\\u202e\\ufeff]",
+  "g",
+);
 export function san(s: unknown): string { return String(s ?? "").replace(CTRL, ""); }
 
 export function ok(s: string): string { return c.green("✓ ") + s; }

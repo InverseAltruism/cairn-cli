@@ -71,10 +71,13 @@ const GOOD_ITEM = {
 };
 let tokenSeenAtRedirectTarget = false;
 let staleMode = false; // R12: when on, the freshness surface reports a frozen tip
+let submitMode = "conflict"; // CLI-C3: "conflict" | "substitute" (ack a DIFFERENT txid) | "evilerr"
+const SUBST_TXID = "0x" + "5c".repeat(32); // a real-looking chain tx the proxy tries to pass off as ours
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, "http://x");
   const j = (o) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(o)); };
   if (u.pathname === "/__stale") { staleMode = u.searchParams.get("on") === "1"; return j({ ok: true, staleMode }); } // test control
+  if (u.pathname === "/__submit") { submitMode = u.searchParams.get("mode") || "conflict"; return j({ ok: true, submitMode }); } // CLI-C3 test control
   if (u.pathname === "/api/health") return j({ ok: true });
   if (u.pathname === "/api/board") return j({ items: [EVIL_ITEM] });
   if (u.pathname.startsWith("/api/item/")) return j({ ok: true, item: u.pathname.includes(GOOD_ID) ? GOOD_ITEM : EVIL_ITEM, supports: [{ attester: "0x" + "22".repeat(20), weight: 1 }], integrityOk: true });
@@ -92,14 +95,23 @@ const server = http.createServer((req, res) => {
     const junk = { txid: "not-a-real-txid;rm -rf", vout: 0, value: 9e9, confirmations: 10, coinbase: false };
     return j({ confirmed_balance: 9e9, utxos: [u.pathname.toLowerCase().includes(WALLET_ADDR.slice(2)) ? okUtxo : junk] });
   }
-  // hostile submit: forge an "already present / conflict" error for a tx that is NOT really ours
-  if (u.pathname === "/api/rpc/tx/submit") return j({ ok: false, err: "tx already present in mempool (conflict)" });
+  // hostile submit. Default: forge an "already present / conflict" error for a tx that is NOT really
+  // ours. "substitute" (CLI-C3): ACK ok:true but report a DIFFERENT, real already-mined txid — the
+  // CLI must refuse, never adopt it. "evilerr" (CLI-C4): an error string laced with ANSI escapes.
+  if (u.pathname === "/api/rpc/tx/submit") {
+    if (submitMode === "substitute") return j({ ok: true, txid: SUBST_TXID });
+    if (submitMode === "evilerr") return j({ ok: false, err: "rejected " + EVIL });
+    return j({ ok: false, err: "tx already present in mempool (conflict)" });
+  }
   // tx-status: the node confirms ONLY MINED_TXID as on-chain (the happy case); every other
   // txid — incl. the conflict case's TX_TXID — is "not found" (no proof), so an evidence-based
   // client must NOT believe the forged conflict string for those.
   if (u.pathname.startsWith("/api/rpc/tx/")) {
     const id = u.pathname.split("/").pop();
-    return id && id.toLowerCase() === MINED_TXID.toLowerCase()
+    // SUBST_TXID is ALSO a genuinely-mined chain tx — so if the CLI ever adopted the proxy's
+    // substituted txid (CLI-C3), confirmMined would falsely succeed. The fix refuses before that.
+    const known = id && (id.toLowerCase() === MINED_TXID.toLowerCase() || id.toLowerCase() === SUBST_TXID.toLowerCase());
+    return known
       ? j({ ok: true, txid: id, block_hash: "0x" + "bb".repeat(32), height: 2 })
       : j({ ok: false, txid: id, err: "not found" });
   }
@@ -183,6 +195,23 @@ check("support: forged conflict → reported as FAILURE, never 'supported'", !/\
 const sendOk = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED })).out;
 check("send: a node-confirmed txid IS reported as 'sent' (evidence accepted, no false negative)", /\bsent\s+0x/i.test(sendOk));
 
+// CLI-C3: a hostile proxy that ACKs ok:true but reports a DIFFERENT (genuinely-mined) txid must be
+// REFUSED — the authoritative txid is the locally-signed one. Adopting sub.txid would defeat H-7
+// (the substituted real tx passes confirmMined/chainTxMined). The CLI must never read 'sent <subst>'.
+console.log("\n— CLI-C3: a proxy-substituted txid (ack ok:true, different id) is REFUSED —");
+await fetch(`${API}/__submit?mode=substitute`);
+const subst = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED })).out;
+check("send: a substituted proxy txid is rejected (never 'sent', flags the mismatch)", /different txid/i.test(subst) && !new RegExp("sent\\s+" + SUBST_TXID, "i").test(subst) && !/\bsent\s+0x5c5c/i.test(subst));
+await fetch(`${API}/__submit?mode=conflict`);
+
+// CLI-C4: a hostile submit ERROR string laced with ANSI/OSC escapes must not reach the TTY raw.
+console.log("\n— CLI-C4: a hostile submit error string is sanitised (no raw escapes) —");
+await fetch(`${API}/__submit?mode=evilerr`);
+const evilErr = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1"], { ...CSDENV, CAIRN_CSD: MOCK_CSD })).out
+  .replace(/\x1b\[[0-9;]*m/g, ""); // strip the CLI's OWN legitimate SGR color codes
+check("send: a hostile submit-error string injects no ESC/BEL/CSI", !hasESC(evilErr));
+await fetch(`${API}/__submit?mode=conflict`);
+
 // UTXO-VALUE-1: a CSD fee is implicit (Σin − Σout) with NO chain max, so a hostile proxy that
 // under-reports the input — or a fat-fingered --fee — silently burns the difference. The max-fee
 // sanity guard must REFUSE an absurd fee BEFORE building/signing, with a --max-fee override.
@@ -236,6 +265,10 @@ console.log("\n— san() unit: strips control chars, keeps printable text —");
 const { san } = await import("../dist/lib/ui.js");
 const s = san("A\x1b[31m\x07B\x9bC\rD");
 check("san removes ESC/BEL/C1/CR, keeps letters", !/[\x00-\x1f\x7f-\x9f]/.test(s) && s.includes("A") && s.includes("D"));
+// CLI-C4-BIDI: bidi-override + zero-width chars must also be stripped (display-spoofing of names/addrs).
+const sb = san("good‮reversed​zw⁦iso⁩﻿bom");
+const BIDIZW = /[؜​-‏⁠⁦-⁩‪-‮﻿]/;
+check("san strips bidi-override + zero-width + BOM, keeps text", !BIDIZW.test(sb) && sb.includes("good") && sb.includes("bom"));
 
 // ── H-1: which `csd` binary signs is pinned/verified, not a bare $PATH lookup ──
 console.log("\n— H-1: csd binary resolution is hardened (no unpinned key-theft binary) —");

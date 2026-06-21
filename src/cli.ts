@@ -7,7 +7,7 @@ import * as csd from "./lib/csd.js";
 import { buildCommitment } from "./lib/item.js";
 import { buildGatewayRecord, buildPeerRecord, buildIdentityCommit, buildIdentityReveal } from "@inversealtruism/csd-registry";
 import { canonicalJson } from "@inversealtruism/csd-codec";
-import { cairnxGet, activeCairnxBase, buildTransferRecord, humanToBase, baseToHuman, CAIRNX_DOMAIN, CAIRNX_ANCHOR_FEE, TICKER_RE, NAME_RE } from "./lib/cairnx.js";
+import { cairnxGet, activeCairnxBase, defaultBases, buildTransferRecord, humanToBase, baseToHuman, CAIRNX_DOMAIN, CAIRNX_ANCHOR_FEE, TICKER_RE, NAME_RE } from "./lib/cairnx.js";
 import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
 import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, anim, clearScreen, cursorHome, san } from "./lib/ui.js";
@@ -50,8 +50,8 @@ function warnIfChangeCollapsed(inputValue: number, txValue: number, fee: number)
   if (change < 0) return; // pickInput already ensures coverage; defensive
   // a healthy spend leaves change ≫ fee unless the user genuinely picked a tight UTXO; flag the
   // case where the implied fee dwarfs the change (what an under-reporting proxy produces).
-  if (change > 0 && fee > change * 4) {
-    console.log(warn(`heads up: change (${csdToCoins(change)} CSD) is much smaller than the fee (${csdToCoins(fee)} CSD).`) +
+  if (change > 0 && fee > change) {
+    console.log(warn(`heads up: change (${csdToCoins(change)} CSD) is smaller than the fee (${csdToCoins(fee)} CSD).`) +
       c.gray(" If your proxy under-reports this input, extra value is burned as fee — verify with your own node, or use ") + c.cyan("--max-fee") + c.gray("."));
   }
 }
@@ -75,9 +75,19 @@ async function pickAndShow(addr: string, need: number, txValue: number, fee: num
   const verified = (v as any).checked && (v as any).ok === true;
   const inputValue = verified ? Number((v as any).value) : picked.value;
   const tag = verified ? c.green(" ✓ verified vs your node")
-            : (CAIRN_RPC ? c.gray(" (independent value check unavailable)") : c.gray(" (set CAIRN_RPC to your own node to independently verify this value)"));
+            : (CAIRN_RPC ? c.gray(" (independent value check unavailable — CAIRN_RPC unreachable)") : c.gray(" (UNVERIFIED — set CAIRN_RPC)"));
   console.log(`${kdim("input")}   ${csdToCoins(inputValue)} CSD ${c.gray("(one UTXO)")}${tag}   ${kdim("change")} ${csdToCoins(Math.max(0, inputValue - txValue - fee))} CSD ${c.gray("back to you")}`);
   warnIfChangeCollapsed(inputValue, txValue, fee);
+  // CLI-C1: cairn-cli is node-less and has no independent view of the picked UTXO's REAL value, so a
+  // hostile/MITM'd CAIRN_API that under-reports it makes `csd` compute a tiny change and silently burn
+  // the rest of YOUR coin as miner fee (the recipient still gets the signed amount; the loss is your
+  // change). The on-chain fee is implicit (Σin−Σout) with NO chain-enforced maximum. The only robust
+  // defense is an INDEPENDENT value source: set CAIRN_RPC to your own node. Make its absence un-missable.
+  if (!verified) {
+    console.log(warn("input value is NOT independently verified.") +
+      c.gray(" A hostile proxy that under-reports it can burn the difference as fee. Set ") + c.cyan("CAIRN_RPC") +
+      c.gray(" to your own node to verify this value cryptographically before spending."));
+  }
   return picked.input;
 }
 // Resolve the user's PUBLIC address (to fetch inputs from the proxy). Never reads the key
@@ -115,8 +125,15 @@ async function resolveAddr(a: Args): Promise<string | null> {
   if (cfg?.default_privkey) {
     const real = await csd.deriveAddr(cfg.default_privkey);
     if (real && /^0x[0-9a-fA-F]{40}$/.test(real)) {
+      const cached2 = saveLocalConfig({ address: real });
       console.log(warn("derived your address from the wallet key once.") + c.gray(" " + csd.keyExposureWarning));
-      saveLocalConfig({ address: real }); return real;
+      // CLI-C2-DERIVEADDR: if the cache write FAILED (read-only HOME, unwritable CAIRN_CLI_CONFIG, …)
+      // the "derive at most once" guarantee is broken — every subsequent call would re-derive and
+      // re-expose the key on the csd argv. Surface it so the user can set a change address / CAIRN_ADDR.
+      if (!cached2) console.log(warn("could NOT cache your address (config write failed)") +
+        c.gray(" — set a change address (") + c.cyan("csd wallet init --privkey <key>") + c.gray(") or ") + c.cyan("CAIRN_ADDR") +
+        c.gray(", otherwise the key is re-derived (and briefly re-exposed on the csd argv) every run."));
+      return real;
     }
   }
   return null;
@@ -135,18 +152,28 @@ async function resolveAddr(a: Args): Promise<string | null> {
 // when the node confirms it. If we can't confirm, we surface the real node message.
 async function signAndSubmit(csdArgs: string[]): Promise<{ ok: boolean; txid?: string; error?: string }> {
   const r = await csd.run(csdArgs);
-  if (!r.ok) return { ok: false, error: (r.stderr || r.stdout || "csd failed").trim().split("\n").slice(-1)[0] };
+  if (!r.ok) return { ok: false, error: san((r.stderr || r.stdout || "csd failed").trim().split("\n").slice(-1)[0]) };
   let out: any = null; try { out = JSON.parse(r.stdout); } catch { /* unexpected */ }
   if (!out?.tx) return { ok: false, error: "csd produced no signed transaction" };
   const txid: string | undefined = out.txid;
   const sub = await api.submitTx(out.tx).catch((e: any) => ({ ok: false, err: e.message }));
-  if (sub.ok) return { ok: true, txid: sub.txid || txid };
+  // CLI-C3: the AUTHORITATIVE txid is the LOCALLY-signed one (csd computed it from the exact bytes
+  // it signed). NEVER adopt the proxy-reported sub.txid — a hostile/MITM'd proxy could drop our tx
+  // and ack a DIFFERENT, already-mined chain tx; that substituted txid would then pass confirmMined
+  // AND an independent chainTxMined (it IS a real tx) and falsely read "confirmed on-chain",
+  // defeating the H-7 evidence-based cure. A divergent proxy txid is a hard failure.
+  const norm = (t?: string) => String(t ?? "").toLowerCase().replace(/^0x/, "");
+  if (sub.ok) {
+    if (sub.txid && txid && norm(sub.txid) !== norm(txid))
+      return { ok: false, error: "proxy reported a different txid than the one we signed — refusing", txid };
+    return { ok: true, txid: txid || sub.txid };
+  }
   // Submit was NOT acked. Don't trust the error STRING — a forged "already present" can hide a
   // rejected/conflicting tx. Confirm against the chain: only if the node reports OUR exact txid
   // as mined is this our own prior submit (a genuine "already in"); otherwise the conflict is a
   // DIFFERENT spend (a real double-spend / hostile reply) and we surface it as a failure.
   if (txid && await api.confirmTxMined(txid)) return { ok: true, txid };
-  return { ok: false, error: sub.err || "submit rejected by node", txid };
+  return { ok: false, error: san(sub.err || "submit rejected by node"), txid };
 }
 // Freshness gate (R12): before building any value tx, consult the proxy's chain-view status so
 // we never sign against a FROZEN or forked tip (the proxy may be failing over to an honest-but-
@@ -197,7 +224,12 @@ function parse(argv: string[]): Args {
 // trustless independence we can't establish).
 function canonHost(h: string): string {
   const x = h.toLowerCase().replace(/^\[|\]$/g, ""); // strip IPv6 brackets
-  return (x === "localhost" || x === "127.0.0.1" || x === "::1" || x === "0.0.0.0") ? "localhost" : x;
+  // CLI-C3-CANONHOST (M-15): the ENTIRE 127.0.0.0/8 range is loopback (one machine), so 127.0.0.1
+  // and 127.0.0.2 must canonicalize equal — else a two-loopback-alias setup (board on 127.0.0.1, a
+  // sham "independent node" on 127.0.0.2) would falsely earn the "trustless via independent CAIRN_RPC"
+  // badge. Map every loopback alias to "localhost".
+  if (x === "localhost" || x === "::1" || x === "0.0.0.0" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(x)) return "localhost";
+  return x;
 }
 function sameHost(a: string, b: string): boolean {
   try { return canonHost(new URL(a).hostname) === canonHost(new URL(b).hostname); } catch { return true; }
@@ -411,7 +443,12 @@ async function confirmMined(txid: string, label: string, wait: boolean) {
   const indep = mined ? await api.chainTxMined(txid).catch(() => null) : null;
   sp.stop();
   if (!mined) { console.log(warn(`${label} submitted — not mined yet; re-check with `) + c.cyan(`cairn show`) + warn(" once a block lands")); return; }
-  if (indep === true) console.log(ok(`${label} confirmed on-chain`) + c.gray("  (verified against your independent node)"));
+  // CLI-C3-CONFIRM-SAMEHOST: only call it an INDEPENDENT confirmation when CAIRN_RPC is a different
+  // machine than CAIRN_API (a same-host node is the same operator, not an independent check) — the
+  // same discipline cmdVerify already applies to its trustless badge.
+  if (indep === true) console.log(ok(`${label} confirmed on-chain`) + (sameHost(CAIRN_RPC, CAIRN_API)
+    ? c.gray("  ⚠ CAIRN_RPC shares a host with CAIRN_API — point it at an independent node for a trustless check")
+    : c.gray("  (verified against your independent node)")));
   else if (indep === false) console.log(err(`${label}: the proxy reports it mined but your node (CAIRN_RPC) does NOT — treat as UNCONFIRMED.`) + c.gray(" A hostile proxy can forge a 'mined' reply; trust your own node."));
   else console.log(warn(`${label}: proxy reports mined`) + c.gray("  — set CAIRN_RPC to your own node to confirm independently (a proxy can forge this signal)."));
 }
@@ -427,7 +464,7 @@ async function cmdPropose(a: Args) {
   // operator-token path stays available for the instance operator
   if (CAIRN_TOKEN && !(await csd.available())) {
     const sp = spinner("posting via operator token");
-    try { const r = await api.apiPropose({ domain, title, body, links, fee }); sp.stop(); console.log(r.ok ? ok(`proposed  ${c.cyan(r.id)}`) + c.gray("  (operator)") : err(r.error || "failed")); } catch (e: any) { sp.stop(); console.log(err(e.message)); }
+    try { const r = await api.apiPropose({ domain, title, body, links, fee }); sp.stop(); console.log(r.ok ? ok(`proposed  ${c.cyan(san(r.id))}`) + c.gray("  (operator)") : err(san(r.error || "failed"))); } catch (e: any) { sp.stop(); console.log(err(san(e.message))); }
     return;
   }
   if (!(await requireCsd())) return;
@@ -471,7 +508,7 @@ async function cmdSupport(a: Args) {
   const confidence = Math.max(0, Math.min(100, parseInt(String(a.flags.confidence ?? 60)) || 0));
   if (CAIRN_TOKEN && !(await csd.available())) {
     const sp = spinner("posting via operator token");
-    try { const r = await api.apiSupport({ id, fee, score, confidence }); sp.stop(); console.log(r.ok ? ok(`supported  ${c.cyan(r.id)}`) + c.gray("  (operator)") : err(r.error || "failed")); } catch (e: any) { sp.stop(); console.log(err(e.message)); }
+    try { const r = await api.apiSupport({ id, fee, score, confidence }); sp.stop(); console.log(r.ok ? ok(`supported  ${c.cyan(san(r.id))}`) + c.gray("  (operator)") : err(san(r.error || "failed"))); } catch (e: any) { sp.stop(); console.log(err(san(e.message))); }
     return;
   }
   if (!(await requireCsd())) return;
@@ -667,9 +704,12 @@ async function main() {
 
 // Anchor a built registry record: Propose{domain, payloadHash} signed by the csd wallet,
 // then publish the EXACT canonical bytes to the content origin (self-certified on arrival).
-async function anchorRecord(rec: { domain: string; content: object; payloadHash: string }, addr: string, fee: number, days: number, label: string): Promise<boolean> {
+async function anchorRecord(a: Args, rec: { domain: string; content: object; payloadHash: string }, addr: string, fee: number, days: number, label: string): Promise<boolean> {
   // max-fee sanity: a fixed-floor record anchor should never burn more than the 1 CSD abs cap.
   if (fee > MAX_FEE_ABS) { console.log(err(`fee ${csdToCoins(fee)} CSD looks abnormally high for a ${label} record (cap ${csdToCoins(MAX_FEE_ABS)} CSD).`) + c.gray(" Lower ") + c.cyan("--fee") + c.gray(".")); return false; }
+  // CLI-C6-ANCHOR-FRESHTIP: registry writes move value (the propose fee) + are in-process-signed, so
+  // they must NOT skip the stale/forked-tip gate every other value-write enforces.
+  if (!(await freshTip(a))) return false;
   const uri = "csd:" + rec.domain.replace(/[^a-z]/gi, "").slice(0, 6) + ":v1:" + rec.payloadHash.slice(2, 14);
   const input = await pickAndShow(addr, fee, 0, fee);
   if (!input) return false;
@@ -705,7 +745,7 @@ async function cmdGateway(a: Args) {
   const rec = buildGatewayRecord({ priv: p.priv, url, kind: a.flags.pin ? "pin" : "gateway", address: p.addr });
   const fee = Math.max(MIN_FEE_PROPOSE, a.flags.fee !== undefined ? CSD(Number(a.flags.fee)) : MIN_FEE_PROPOSE);
   if (a.flags["dry-run"]) { console.log(`${kdim("domain")} ${c.cyan(rec.domain)}\n${kdim("url")}    ${c.white(url)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
-  await anchorRecord(rec, p.addr, fee, 10, "gateway");
+  await anchorRecord(a, rec, p.addr, fee, 10, "gateway");
 }
 
 async function cmdPeer(a: Args) {
@@ -718,7 +758,7 @@ async function cmdPeer(a: Args) {
   const rec = buildPeerRecord({ priv: p.priv, peer_id: peerId, multiaddrs, caps: caps.length ? caps : undefined, address: p.addr });
   const fee = Math.max(MIN_FEE_PROPOSE, a.flags.fee !== undefined ? CSD(Number(a.flags.fee)) : MIN_FEE_PROPOSE);
   if (a.flags["dry-run"]) { console.log(`${kdim("domain")} ${c.cyan(rec.domain)}\n${kdim("peer")}   ${c.white(peerId)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
-  await anchorRecord(rec, p.addr, fee, 10, "peer");
+  await anchorRecord(a, rec, p.addr, fee, 10, "peer");
 }
 
 async function cmdIdentity(a: Args) {
@@ -734,14 +774,14 @@ async function cmdIdentity(a: Args) {
     if (!/^[0-9a-f]{16,}$/i.test(salt)) { console.log(err("--salt <hex> from your earlier --commit-only step is required to reveal")); return; }
     const rec = buildIdentityReveal({ priv: p.priv, handle, salt, address: p.addr });
     if (a.flags["dry-run"]) { console.log(`${kdim("reveal")} ${c.white(handle)} → ${c.cyan(p.addr)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed")); return; }
-    await anchorRecord(rec, p.addr, fee, 90, "identity reveal");
+    await anchorRecord(a, rec, p.addr, fee, 90, "identity reveal");
     return;
   }
   // default / --commit-only: step 1
   const salt = String(a.flags.salt ?? randomBytes(16).toString("hex"));
   const rec = buildIdentityCommit({ handle, salt, address: p.addr });
   if (a.flags["dry-run"]) { console.log(`${kdim("commit")} ${c.white(handle)}\n${kdim("salt")}   ${c.magenta(salt)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed")); return; }
-  const okc = await anchorRecord(rec, p.addr, fee, 90, "identity commit");
+  const okc = await anchorRecord(a, rec, p.addr, fee, 90, "identity commit");
   if (okc) console.log(c.gray("\n  save this salt — reveal NEXT epoch (~1h):  ") + c.cyan(`cairn identity claim ${handle} --reveal --salt ${salt}`));
 }
 
@@ -751,10 +791,14 @@ async function cmdIdentity(a: Args) {
 // Display: base units → human, with thousands grouping. decimals===undefined (a ticker the
 // API doesn't know) falls back to raw base units rather than guessing a scale.
 const group = (s: string) => s.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+// CLI-C4-AMOUNTDOS: read-API amounts are attacker-controlled strings; a non-numeric one would throw
+// inside BigInt()/baseToHuman() and crash the whole read/display. Parse defensively (0n on garbage)
+// so one hostile balance can't take down `tokens`/`token-info`.
+const big = (x: unknown): bigint => { try { return BigInt(String(x ?? "0")); } catch { return 0n; } };
 function tokAmt(base: string, decimals: number | undefined): string {
   if (decimals === undefined) return `${group(String(base))} (base units)`;
-  const [i, f] = baseToHuman(String(base), decimals).split(".");
-  return group(i!) + (f ? "." + f : "");
+  try { const [i, f] = baseToHuman(big(base), decimals).split("."); return group(i!) + (f ? "." + f : ""); }
+  catch { return `${group(big(base).toString())} (base units)`; }
 }
 // The address a CairnX read targets: positional arg → --address/CAIRN_ADDR/csd wallet.
 async function resolveCairnxAddr(a: Args, positional?: string): Promise<string | null> {
@@ -782,7 +826,7 @@ async function cmdTokens(a: Args) {
   const bals = Object.entries(acct.balances ?? {}) as [string, any][];
   if (!bals.length) console.log(c.gray("  no token balances"));
   for (const [ticker, b] of bals) {
-    const locked = BigInt(String(b.locked ?? "0"));
+    const locked = big(b.locked);
     console.log(`  ${c.cyan(pad(san(ticker), 14))} ${c.white(tokAmt(String(b.available ?? "0"), dec[ticker]))}${locked > 0n ? c.gray(` · ${tokAmt(String(b.locked), dec[ticker])} locked in open offers`) : ""}`);
   }
   const names: string[] = acct.names ?? [];
@@ -792,20 +836,20 @@ async function cmdTokens(a: Args) {
 async function cmdTokenInfo(a: Args) {
   const ticker = String(a._[1] ?? "").toUpperCase();
   if (!TICKER_RE.test(ticker)) { console.log(warn("usage: ") + c.cyan("cairn token-info <TICKER>")); return; }
-  const t = await cairnxGet(`/token/${encodeURIComponent(ticker)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unknown token ${ticker}`) : err(e.message)); return null; });
+  const t = await cairnxGet(`/token/${encodeURIComponent(ticker)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unknown token ${san(ticker)}`) : err(san(e.message))); return null; });
   if (!t) return;
   banner(); rule(`token · ${san(t.ticker)}`);
   const row = (k: string, v: string) => console.log(`  ${kdim(pad(k, 11))} ${v}`);
   row("name", c.white(san(t.name ?? t.ticker)));
   row("decimals", c.white(String(t.decimals)));
   row("supply", `${c.white(tokAmt(String(t.supply), t.decimals))} ${c.gray("max")}`);
-  const minted = BigInt(String(t.minted ?? "0")), supply = BigInt(String(t.supply ?? "0"));
+  const minted = big(t.minted), supply = big(t.supply);
   row("minted", `${c.white(tokAmt(String(t.minted), t.decimals))}${supply > 0n ? c.gray(` · ${Number((minted * 10000n) / supply) / 100}% of supply`) : ""}`);
   row("mint", t.mint === "open" ? c.green("open") + c.gray(` · up to ${tokAmt(String(t.mintLimit ?? "0"), t.decimals)} per mint`) : c.gray("issuer-only"));
   row("deployer", c.gray(san(t.deployer)));
   row("deployed", c.gray(`height ${Number(t.height)} · id ${san(String(t.deployId ?? "")).slice(0, 22)}…`));
   // top-10 holders by total (available + locked) — the same reading the explorer shows
-  const holders = Object.entries(t.holders ?? {}).map(([h, b]: [string, any]) => ({ h, total: BigInt(String(b.available ?? "0")) + BigInt(String(b.locked ?? "0")) }))
+  const holders = Object.entries(t.holders ?? {}).map(([h, b]: [string, any]) => ({ h, total: big(b.available) + big(b.locked) }))
     .filter((x) => x.total > 0n).sort((x, y) => (y.total > x.total ? 1 : y.total < x.total ? -1 : 0));
   console.log(`\n  ${kdim("holders")}    ${c.white(String(holders.length))}${holders.length > 10 ? c.gray(" · top 10") : ""}`);
   const max = holders[0]?.total ?? 1n;
@@ -831,28 +875,44 @@ async function cmdTokenSend(a: Args) {
   if (!ticker || !a.flags.to || a.flags.amount === undefined) { console.log(warn("usage: ") + c.cyan("cairn token-send --ticker CAIRN --to 0x…40 --amount 1.5 [--dry-run] [--yes]")); return; }
   if (!TICKER_RE.test(ticker)) { console.log(err(`bad ticker: ${san(ticker)}`)); return; }
   if (!/^0x[0-9a-fA-F]{40}$/.test(to)) { console.log(err(`bad recipient: ${san(to)}`)); return; }
-  // decimals are AUTHORITATIVE from the token's deploy record — never guessed
-  const t = await cairnxGet(`/token/${encodeURIComponent(ticker)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unknown token ${ticker}`) : err(e.message)); return null; });
+  // CLI-C5-DECIMALS: `decimals` drives the human→base scale but is reported by an UNauthenticated
+  // CairnX read API (no signature/SPV) — a hostile gateway over-reporting it silently inflates the
+  // MAGNITUDE of your transfer. So: (1) when not pinned to a single CAIRNX_API, cross-check decimals
+  // across the default bases and refuse on disagreement (dual-source discipline); (2) always show +
+  // confirm the exact base-unit integer so a wrong scale is visible before signing.
+  const t = await cairnxGet(`/token/${encodeURIComponent(ticker)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unknown token ${ticker}`) : err(san(e.message))); return null; });
   if (!t) return;
+  const decimals = Number(t.decimals);
+  const bases = defaultBases();
+  if (bases.length > 1) {
+    const seen = await Promise.all(bases.map((b) => cairnxGet(`/token/${encodeURIComponent(ticker)}`, [b]).then((x: any) => Number(x?.decimals)).catch(() => null)));
+    const consistent = seen.filter((d): d is number => Number.isInteger(d));
+    if (consistent.length >= 2 && new Set(consistent).size > 1) {
+      console.log(err(`CairnX sources DISAGREE on ${ticker} decimals (${[...new Set(consistent)].join(" vs ")}) — refusing to scale the amount against an ambiguous decimals (pin CAIRNX_API to a trusted base).`));
+      return;
+    }
+  }
   let amount: bigint;
-  try { amount = humanToBase(amountStr, Number(t.decimals)); } catch (e: any) { console.log(err(e.message)); return; }
+  try { amount = humanToBase(amountStr, decimals); } catch (e: any) { console.log(err(san(e.message))); return; }
   if (amount <= 0n) { console.log(err("amount must be > 0")); return; }
   const from = await resolveAddr(a); if (!from) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
   // balance check against the same state the resolver will apply the transfer to
   const acct = await cairnxGet(`/address/${encodeURIComponent(from.toLowerCase())}`);
-  const avail = BigInt(String(acct.balances?.[ticker]?.available ?? "0"));
-  if (avail < amount) { console.log(err(`insufficient ${ticker}: balance ${tokAmt(avail.toString(), t.decimals)}, tried to send ${tokAmt(amount.toString(), t.decimals)}${BigInt(String(acct.balances?.[ticker]?.locked ?? "0")) > 0n ? ` (${tokAmt(String(acct.balances[ticker].locked), t.decimals)} more is locked in open offers)` : ""}`)); return; }
-  let built; try { built = buildTransferRecord({ ticker, to, amount }); } catch (e: any) { console.log(err(e.message)); return; }
-  // clear-print exactly what will be anchored before anything signs
-  console.log(`${kdim("send")}    ${c.white(tokAmt(amount.toString(), t.decimals))} ${c.cyan(ticker)} ${c.gray(`(${amount} base units · ${t.decimals} decimals)`)}`);
+  const avail = big(acct.balances?.[ticker]?.available);
+  if (avail < amount) { console.log(err(`insufficient ${ticker}: balance ${tokAmt(avail.toString(), decimals)}, tried to send ${tokAmt(amount.toString(), decimals)}${big(acct.balances?.[ticker]?.locked) > 0n ? ` (${tokAmt(String(acct.balances[ticker].locked), decimals)} more is locked in open offers)` : ""}`)); return; }
+  let built; try { built = buildTransferRecord({ ticker, to, amount }); } catch (e: any) { console.log(err(san(e.message))); return; }
+  // clear-print exactly what will be anchored before anything signs — the EXACT base-unit integer is
+  // emphasized on its own line (CLI-C5: a wrong API-reported `decimals` shows up here as a magnitude).
+  console.log(`${kdim("send")}    ${c.white(tokAmt(amount.toString(), decimals))} ${c.cyan(ticker)}`);
+  console.log(`${kdim("amount")}  ${c.white(c.bold(amount.toString()))} ${c.gray(`base units · ${decimals} decimals (from the CairnX read API — verify this magnitude)`)}`);
   console.log(`${kdim("to")}      ${c.cyan(to.toLowerCase())}`);
-  console.log(`${kdim("from")}    ${c.cyan(from.toLowerCase())} ${c.gray(`· ${ticker} balance ${tokAmt(avail.toString(), t.decimals)}`)}`);
-  console.log(`${kdim("record")}  ${c.white(built.uri)}`);
+  console.log(`${kdim("from")}    ${c.cyan(from.toLowerCase())} ${c.gray(`· ${ticker} balance ${tokAmt(avail.toString(), decimals)}`)}`);
+  console.log(`${kdim("record")}  ${c.white(san(built.uri))}`);
   console.log(`${kdim("hash")}    ${c.magenta(built.payloadHash)}`);
   console.log(`${kdim("anchor")}  ${c.gray(`Propose on ${CAIRNX_DOMAIN} — costs `)}${c.white(csdToCoins(CAIRNX_ANCHOR_FEE) + " CSD")}${c.gray(" (the chain fee; the tokens themselves move by record)")}`);
   if (a.flags["dry-run"]) { console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
   if (!(await requireCsd())) return;
-  if (!a.flags.yes && !(await confirmSend(`\nsend ${tokAmt(amount.toString(), t.decimals)} ${ticker} for ${csdToCoins(CAIRNX_ANCHOR_FEE)} CSD? [y/N] `))) { console.log(c.gray("aborted")); return; }
+  if (!a.flags.yes && !(await confirmSend(`\nsend ${tokAmt(amount.toString(), decimals)} ${ticker} (${amount} base units) for ${csdToCoins(CAIRNX_ANCHOR_FEE)} CSD? [y/N] `))) { console.log(c.gray("aborted")); return; }
   if (!(await freshTip(a))) return;
   const input = await pickAndShow(from, CAIRNX_ANCHOR_FEE, 0, CAIRNX_ANCHOR_FEE);
   if (!input) return;
@@ -877,7 +937,7 @@ async function cmdNames(a: Args) {
 async function cmdName(a: Args) {
   const n = String(a._[1] ?? "").toLowerCase();
   if (!n || !NAME_RE.test(n)) { console.log(warn("usage: ") + c.cyan("cairn name <name>") + c.gray("  (lowercase, 3–32 chars [a-z0-9-])")); return; }
-  const r = await cairnxGet(`/name/${encodeURIComponent(n)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unregistered name "${n}"`) + c.gray(" — claimable via commit-reveal on /trade") : err(e.message)); return null; });
+  const r = await cairnxGet(`/name/${encodeURIComponent(n)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unregistered name "${san(n)}"`) + c.gray(" — claimable via commit-reveal on /trade") : err(san(e.message))); return null; });
   if (!r) return;
   banner(); rule(`name · ${san(r.name ?? n)}`);
   const row = (k: string, v: string) => console.log(`  ${kdim(pad(k, 10))} ${v}`);
@@ -899,4 +959,4 @@ async function cmdName(a: Args) {
   } else row("offer", c.gray("no open offer"));
 }
 
-main().catch((e) => { console.error(err(String(e?.message ?? e))); process.exit(1); });
+main().catch((e) => { console.error(err(san(String(e?.message ?? e)))); process.exit(1); });

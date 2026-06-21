@@ -2,13 +2,15 @@
 // `cairnx:v1` domain. This file is the CLI's complete CairnX surface:
 //   • a READ client for the CairnX state API (resolution order: $CAIRNX_API → the local
 //     service → the public gateway, GET-only) with automatic fallback on network failure
-//   • the canonical TRANSFER record builder — hand-rolled on the repo's own
-//     stableStringify/sha256 (byte-exact-tested against cairnx-core's ground truth) so the
-//     CLI takes NO dependency on the private cairnx repo.
-//     TODO: swap to @inversealtruism/cairnx-core once it is published to npm.
+//   • the canonical TRANSFER record builder — canonicalised with the SAME @inversealtruism/csd-codec
+//     `canonicalJson` the resolver uses (single source of truth), so the CLI's on-chain payload_hash
+//     is byte-identical to the resolver's by construction (CLI-C7: was a hand-rolled stableStringify,
+//     proven byte-identical to canonicalJson for the transfer-record shape, now consolidated to remove
+//     the latent dual-canonicaliser seam).
 //   • exact human↔base-unit amount math as STRING/BigInt arithmetic — floats never touch
 //     token amounts (no "1.1 * 1e8 = 110000000.00000001" class of bug, no silent truncation).
-import { stableStringify, sha256Hex } from "./item.js";
+import { sha256Hex } from "./item.js";
+import { canonicalJson } from "@inversealtruism/csd-codec";
 
 export const CAIRNX_DOMAIN = "cairnx:v1";
 export const CAIRNX_ANCHOR_FEE = 25_000_000; // 0.25 CSD — the consensus min Propose fee that anchors a record
@@ -37,7 +39,7 @@ export function buildTransferRecord(p: { ticker: string; to: string; amount: big
   if (p.amount <= 0n) throw new Error("amount must be > 0");
   if (p.amount > MAX_AMOUNT) throw new Error("amount exceeds the 96-bit token-amount limit");
   const record = { amount: p.amount.toString(), t: "transfer" as const, ticker: p.ticker, to, v: 1 as const };
-  const uri = stableStringify(record);
+  const uri = canonicalJson(record);
   if (Buffer.byteLength(uri, "utf8") > MAX_RECORD_BYTES) throw new Error("record exceeds 512 bytes"); // unreachable for a transfer, kept as a guard
   return { record, uri, payloadHash: sha256Hex(uri) };
 }

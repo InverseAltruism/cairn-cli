@@ -22,10 +22,15 @@ export function csdToCoins(base: number): string {
 // to redirect `cairn address` output (F13/R18 — the wallet is still the source of truth).
 const CFG_PATH = process.env.CAIRN_CLI_CONFIG ?? join(homedir(), ".config", "cairn-cli", "config.json");
 export function loadLocalConfig(): { address?: string } { try { return JSON.parse(readFileSync(CFG_PATH, "utf8")); } catch { return {}; } }
-export function saveLocalConfig(patch: { address?: string }): void {
+// Returns true iff the address was durably persisted. CLI-C2: a SILENT failure here breaks the
+// H-2 "derive the key-on-argv address at most once" guarantee — a read-only HOME / unwritable
+// CAIRN_CLI_CONFIG / full disk would make every subsequent call re-derive (re-exposing the key on
+// the csd argv). Callers surface a warning on false so the user can fix the cache (or stop deriving).
+export function saveLocalConfig(patch: { address?: string }): boolean {
   try {
     mkdirSync(dirname(CFG_PATH), { recursive: true, mode: 0o700 });
     writeFileSync(CFG_PATH, JSON.stringify({ ...loadLocalConfig(), ...patch }, null, 2) + "\n", { mode: 0o600 });
     chmodSync(CFG_PATH, 0o600); // tighten even if the file pre-existed (writeFileSync mode is create-only)
-  } catch { /* best-effort */ }
+    return true;
+  } catch { return false; }
 }
