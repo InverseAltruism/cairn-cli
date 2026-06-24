@@ -10,17 +10,16 @@
 //   • exact human↔base-unit amount math as STRING/BigInt arithmetic — floats never touch
 //     token amounts (no "1.1 * 1e8 = 110000000.00000001" class of bug, no silent truncation).
 import { sha256Hex } from "./item.js";
-import { canonicalJson } from "@inversealtruism/csd-codec";
+import { canonicalJson, MIN_FEE_PROPOSE } from "@inversealtruism/csd-codec";
+// ★ Consensus shapes/constants are IMPORTED from cairnx-core, not hand-declared (shared-core de-dup,
+// cairn docs/Plans/46): they validate a record BEFORE the CLI spends the anchor fee, so a drifted regex /
+// limit would build a record the resolver no-ops (a lost fee). One source = the published convention.
+import { DOMAIN, TICKER_RE, NAME_RE, ADDR_RE, MAX_AMOUNT, MAX_RECORD_BYTES } from "@inversealtruism/cairnx-core";
 
-export const CAIRNX_DOMAIN = "cairnx:v1";
-export const CAIRNX_ANCHOR_FEE = 25_000_000; // 0.25 CSD — the consensus min Propose fee that anchors a record
-export const MAX_AMOUNT = (1n << 96n) - 1n; // CONVENTION.md: token amounts are ≤ 96-bit
-const MAX_RECORD_BYTES = 512; // consensus MAX_URI_BYTES — the record must fit in `uri`
-
-// Validation shapes (mirrors CONVENTION.md §4 — kept in sync by the byte-exact fixtures).
-export const TICKER_RE = /^[A-Z][A-Z0-9]{2,11}$/;
-export const NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/; // a claimable .csd name
-const ADDR_RE = /^0x[0-9a-f]{40}$/; // records carry LOWERCASE addresses
+export const CAIRNX_DOMAIN = DOMAIN;              // "cairnx:v1"
+export const CAIRNX_ANCHOR_FEE = MIN_FEE_PROPOSE; // 0.25 CSD — the consensus min Propose fee that anchors a record
+// re-export the §4 shapes the CLI's public surface exposed (now single-sourced from cairnx-core)
+export { TICKER_RE, NAME_RE, MAX_AMOUNT };
 
 // ── canonical transfer record ─────────────────────────────────────────────────────────────
 // A token transfer is a Propose on cairnx:v1 whose uri IS the record:
