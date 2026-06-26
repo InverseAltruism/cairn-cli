@@ -82,8 +82,7 @@ Fees and amounts are in **CSD** (e.g. `--amount 1.5`, `--fee 0.05`). Minimums: 0
 
 CairnX is the token / DeFi layer that lives entirely in `cairnx:v1` records on-chain
 (traded at [cairn-substrate.com/trade](https://cairn-substrate.com/trade)). Reads hit the
-CairnX state API (`CAIRNX_API` → local service → public gateway); the one write —
-`token-send` — anchors a canonical transfer record signed by your own `csd` wallet.
+CairnX state API (`CAIRNX_API` → local service → public gateway); the one write, `token-send`, anchors a canonical transfer record signed by your own `csd` wallet.
 
 ```bash
 cairn tokens [address]                  # token balances (locked shown) + owned .csd names
@@ -124,7 +123,7 @@ signs, and `--dry-run` shows the exact canonical record + hash without signing).
   state API. `token-send` builds the canonical transfer record locally (`sha256(uri)` is the
   on-chain commitment, byte-exact-tested against the resolver's own builder), checks your
   balance, prints the record + the 0.25 CSD anchor cost, then has `csd` sign the anchoring
-  Propose — the same no-key-in-process path as `propose`/`send`.
+  Propose, the same no-key-in-process path as `propose`/`send`.
 - **registry commands** (`gateway register`, `peer announce`, `identity claim`) are the one
   exception: they sign a registry *binding* with `@inversealtruism/csd-registry`, so cairn-cli reads
   your private key from `csd wallet config` and signs **in-process** (the key is never networked - only
