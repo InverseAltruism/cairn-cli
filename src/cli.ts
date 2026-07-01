@@ -818,6 +818,14 @@ async function tokenDecimals(): Promise<Record<string, number>> {
   return map;
 }
 
+// A name in `acct.nameDetails` with pending:true is a v2.5/v2.6 reservation (revealed, not yet finalized):
+// the resolver gives it no send address and no owner actions until nfinalize. Mark it so a reservation is
+// never shown as an owned name. Defensive — an older resolver that omits nameDetails yields an empty set.
+function pendingNames(acct: any): Set<string> {
+  return new Set<string>((acct?.nameDetails ?? []).filter((d: any) => d?.pending).map((d: any) => String(d.name)));
+}
+const nameCell = (n: string, pend: Set<string>) => pend.has(n) ? c.cyan(san(n)) + c.gray(" (finalizing)") : c.green(san(n));
+
 async function cmdTokens(a: Args) {
   const addr = await resolveCairnxAddr(a, a._[1]); if (!addr) return;
   const [acct, dec] = await Promise.all([cairnxGet(`/address/${encodeURIComponent(addr)}`), tokenDecimals()]);
@@ -830,7 +838,8 @@ async function cmdTokens(a: Args) {
     console.log(`  ${c.cyan(pad(san(ticker), 14))} ${c.white(tokAmt(String(b.available ?? "0"), dec[ticker]))}${locked > 0n ? c.gray(` · ${tokAmt(String(b.locked), dec[ticker])} locked in open offers`) : ""}`);
   }
   const names: string[] = acct.names ?? [];
-  console.log(`\n  ${kdim(".csd names")} ${names.length ? names.map((n) => c.green(san(n))).join(c.gray(" · ")) : c.gray("none")}`);
+  const pend = pendingNames(acct);
+  console.log(`\n  ${kdim(".csd names")} ${names.length ? names.map((n) => nameCell(n, pend)).join(c.gray(" · ")) : c.gray("none")}`);
 }
 
 async function cmdTokenInfo(a: Args) {
@@ -930,7 +939,8 @@ async function cmdNames(a: Args) {
   if (a.flags.json) { console.log(JSON.stringify(names, null, 2)); return; }
   banner(); rule(`.csd names · ${addr.slice(0, 10)}…`);
   if (!names.length) { console.log(c.gray("  no names owned — claim one on " + (activeCairnxBase()?.includes("127.0.0.1") ? "the /trade marketplace" : "https://cairn-substrate.com/trade"))); return; }
-  for (const n of names) console.log(`  ${c.green(san(n))}`);
+  const pend = pendingNames(acct);
+  for (const n of names) console.log(`  ${nameCell(n, pend)}${pend.has(n) ? c.gray("  · complete on /trade") : ""}`);
   console.log(c.gray(`\n  ${names.length} name${names.length === 1 ? "" : "s"} · cairn name <name> for detail`));
 }
 
