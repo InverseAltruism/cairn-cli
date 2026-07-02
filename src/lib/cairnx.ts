@@ -9,12 +9,12 @@
 //     the latent dual-canonicaliser seam).
 //   • exact human↔base-unit amount math as STRING/BigInt arithmetic — floats never touch
 //     token amounts (no "1.1 * 1e8 = 110000000.00000001" class of bug, no silent truncation).
-import { sha256Hex } from "./item.js";
-import { canonicalJson, MIN_FEE_PROPOSE } from "@inversealtruism/csd-codec";
-// ★ Consensus shapes/constants are IMPORTED from cairnx-core, not hand-declared (shared-core de-dup,
-// cairn docs/Plans/46): they validate a record BEFORE the CLI spends the anchor fee, so a drifted regex /
-// limit would build a record the resolver no-ops (a lost fee). One source = the published convention.
-import { DOMAIN, TICKER_RE, NAME_RE, ADDR_RE, MAX_AMOUNT, MAX_RECORD_BYTES } from "@inversealtruism/cairnx-core";
+import { MIN_FEE_PROPOSE } from "@inversealtruism/csd-codec";
+// ★ Consensus shapes/constants AND the record builder are IMPORTED from cairnx-core, not
+// hand-declared (shared-core de-dup, cairn docs/Plans/46 + 57 B5a): they validate a record BEFORE
+// the CLI spends the anchor fee, so a drifted regex / limit would build a record the resolver
+// no-ops (a lost fee). One source = the published convention.
+import { DOMAIN, TICKER_RE, NAME_RE, ADDR_RE, MAX_AMOUNT, transfer } from "@inversealtruism/cairnx-core";
 
 export const CAIRNX_DOMAIN = DOMAIN;              // "cairnx:v1"
 export const CAIRNX_ANCHOR_FEE = MIN_FEE_PROPOSE; // 0.25 CSD — the consensus min Propose fee that anchors a record
@@ -33,14 +33,16 @@ export interface BuiltTransfer {
 }
 export function buildTransferRecord(p: { ticker: string; to: string; amount: bigint }): BuiltTransfer {
   const to = String(p.to).toLowerCase();
+  // Friendly pre-checks first (CLI-grade error messages), then the CANONICAL builder does the
+  // authoritative work (Plan 57 B5a): cairnx-core transfer() round-trips through parseRecord, so
+  // what the CLI anchors is valid-by-construction against CONVENTION.md, not a hand-kept mirror.
+  // Output is byte-identical to the old hand-assembly (same record keys; canonicalJson sorts).
   if (!TICKER_RE.test(p.ticker)) throw new Error(`bad ticker "${p.ticker}" — want 3–12 chars [A-Z0-9], starting with a letter`);
   if (!ADDR_RE.test(to)) throw new Error(`bad recipient "${p.to}" — want a 0x… 20-byte address`);
   if (p.amount <= 0n) throw new Error("amount must be > 0");
   if (p.amount > MAX_AMOUNT) throw new Error("amount exceeds the 96-bit token-amount limit");
-  const record = { amount: p.amount.toString(), t: "transfer" as const, ticker: p.ticker, to, v: 1 as const };
-  const uri = canonicalJson(record);
-  if (Buffer.byteLength(uri, "utf8") > MAX_RECORD_BYTES) throw new Error("record exceeds 512 bytes"); // unreachable for a transfer, kept as a guard
-  return { record, uri, payloadHash: sha256Hex(uri) };
+  const built = transfer({ ticker: p.ticker, to, amount: p.amount.toString() });
+  return { record: built.record as BuiltTransfer["record"], uri: built.uri, payloadHash: built.payloadHash };
 }
 
 // ── exact amount math (strings + BigInt only) ─────────────────────────────────────────────

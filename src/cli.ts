@@ -12,7 +12,17 @@ import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
 import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, anim, clearScreen, cursorHome, san } from "./lib/ui.js";
 
-const CSD = (n: number) => Number.isFinite(n) ? Math.round(n * CSD_PER_COIN) : NaN; // CSD → base units
+// CSD → base units via EXACT decimal-string parsing (Plan 57 B5a; Plan 56 A.4 finding 3). The
+// old `Math.round(n * 1e8)` float path silently lost precision above ~9e7 CSD; this reuses the
+// token path's exact converter (humanToBase, 8 dp), so both money paths speak the same input
+// language (plain decimals; no exponent/hex forms). Unparseable or beyond-2^53 amounts return
+// NaN, which every call site's isSafeInteger guard treats as invalid (fail-loud, never silently
+// wrong; the three registry fee sites gained that guard in this same change, closing an old
+// Math.max(MIN, NaN) fee-poison path that could reach the signer as a literal "NaN").
+const CSD = (v: unknown): number => {
+  try { const b = humanToBase(String(v), 8); return b <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(b) : NaN; }
+  catch { return NaN; }
+};
 
 // ── max-fee sanity guard (UTXO-VALUE-1) ──────────────────────────────────────────────────────
 // A CSD fee is implicit (Σin − Σout) and the chain enforces NO maximum, so a hostile proxy that
@@ -26,7 +36,7 @@ const CSD = (n: number) => Number.isFinite(n) ? Math.round(n * CSD_PER_COIN) : N
 const MAX_FEE_ABS = 100_000_000;          // 1 CSD absolute floor — every honest fee is well under this
 const MAX_FEE_VALUE_FRACTION = 0.25;      // …and ≤ 25% of the value moved
 function feeCap(txValue: number, a: Args): number {
-  if (a.flags["max-fee"] !== undefined) { const m = CSD(Number(a.flags["max-fee"])); if (Number.isSafeInteger(m) && m >= 0) return m; }
+  if (a.flags["max-fee"] !== undefined) { const m = CSD(a.flags["max-fee"]); if (Number.isSafeInteger(m) && m >= 0) return m; }
   return Math.max(MAX_FEE_ABS, Math.floor(Math.max(0, txValue) * MAX_FEE_VALUE_FRACTION));
 }
 // Guard a value-write before it is built/signed. `txValue` = the value the user means to move
@@ -393,8 +403,8 @@ async function cmdBalance(a: Args) { return cmdAddress(a); }
 
 function gatherOutputs(a: Args): { to: string; value: number }[] | string {
   const outs: { to: string; value: number }[] = [];
-  for (const spec of (a.multi.output ?? [])) { const i = String(spec).lastIndexOf(":"); if (i < 0) return `bad --output (want <addr>:<CSD>): ${spec}`; outs.push({ to: String(spec).slice(0, i), value: CSD(Number(String(spec).slice(i + 1))) }); }
-  if (a.flags.to !== undefined || a.flags.amount !== undefined) outs.push({ to: String(a.flags.to ?? ""), value: CSD(Number(a.flags.amount ?? 0)) });
+  for (const spec of (a.multi.output ?? [])) { const i = String(spec).lastIndexOf(":"); if (i < 0) return `bad --output (want <addr>:<CSD>): ${spec}`; outs.push({ to: String(spec).slice(0, i), value: CSD(String(spec).slice(i + 1)) }); }
+  if (a.flags.to !== undefined || a.flags.amount !== undefined) outs.push({ to: String(a.flags.to ?? ""), value: CSD(a.flags.amount ?? 0) });
   for (const o of outs) { if (!/^0x[0-9a-fA-F]{40}$/.test(o.to)) return `bad recipient: ${o.to}`; if (!(o.value > 0) || !Number.isSafeInteger(o.value)) return `bad amount for ${o.to}`; }
   return outs.length ? outs : "no outputs";
 }
@@ -403,8 +413,8 @@ async function cmdSend(a: Args) {
   if (typeof outs === "string") { console.log(outs === "no outputs" ? warn("usage: ") + c.cyan("cairn send --to <0x…40> --amount <CSD> [--fee <CSD>]") + c.gray("  (repeat --output <a>:<CSD> for many)") : err(outs)); return; }
   if (!(await requireCsd())) return;
   const addr = await resolveAddr(a); if (!addr) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
-  const feeCsd = a.flags.fee !== undefined ? Number(a.flags.fee) : 0.01;
-  const fee = (Number.isFinite(feeCsd) && feeCsd >= 0) ? CSD(feeCsd) : 1_000_000;
+  const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : 1_000_000;
+  const fee = (Number.isSafeInteger(feeFlag) && feeFlag >= 0) ? feeFlag : 1_000_000;
   const total = outs.reduce((s, o) => s + o.value, 0);
   console.log(`${kdim("from")}    ${c.cyan(addr)}`);
   for (const o of outs) console.log(`${kdim("to")}      ${c.cyan(o.to)} ${c.gray("→ " + csdToCoins(o.value) + " CSD")}`);
@@ -459,8 +469,8 @@ async function cmdPropose(a: Args) {
   const body = String(a.flags.body ?? "");
   const links = a.multi.link ?? [];
   if (!domain || !title) { console.log(warn("usage: ") + c.cyan("cairn propose --domain csd:features --title <t> --body <b> [--link <url>] [--fee <CSD>] [--expires-days N]")); return; }
-  const feeCsd = a.flags.fee !== undefined ? Number(a.flags.fee) : 0.25;
-  const fee = Math.max(MIN_FEE_PROPOSE, Number.isFinite(feeCsd) ? CSD(feeCsd) : MIN_FEE_PROPOSE);
+  const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_PROPOSE;
+  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE);
   // operator-token path stays available for the instance operator
   if (CAIRN_TOKEN && !(await csd.available())) {
     const sp = spinner("posting via operator token");
@@ -502,8 +512,8 @@ async function cmdSupport(a: Args) {
   const id = a._[1];
   if (!id) { console.log(warn("usage: ") + c.cyan("cairn support <id> --fee <CSD> [--score 0-100] [--confidence 0-100]")); return; }
   if (!/^0x[0-9a-fA-F]{64}$/.test(id)) { console.log(err("proposal id must be 0x…64-hex")); return; }
-  const feeCsd = a.flags.fee !== undefined ? Number(a.flags.fee) : 0.05;
-  const fee = Math.max(MIN_FEE_ATTEST, Number.isFinite(feeCsd) ? CSD(feeCsd) : MIN_FEE_ATTEST);
+  const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_ATTEST;
+  const fee = Math.max(MIN_FEE_ATTEST, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_ATTEST);
   const score = Math.max(0, Math.min(100, parseInt(String(a.flags.score ?? 75)) || 0));
   const confidence = Math.max(0, Math.min(100, parseInt(String(a.flags.confidence ?? 60)) || 0));
   if (CAIRN_TOKEN && !(await csd.available())) {
@@ -743,7 +753,8 @@ async function cmdGateway(a: Args) {
   if (!url.includes("{hash}")) { console.log(err("--url must contain the {hash} template, e.g. https://gw/content/0x{hash}")); return; }
   const p = await registryPrep(a); if (!p) return;
   const rec = buildGatewayRecord({ priv: p.priv, url, kind: a.flags.pin ? "pin" : "gateway", address: p.addr });
-  const fee = Math.max(MIN_FEE_PROPOSE, a.flags.fee !== undefined ? CSD(Number(a.flags.fee)) : MIN_FEE_PROPOSE);
+  const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_PROPOSE;
+  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
   if (a.flags["dry-run"]) { console.log(`${kdim("domain")} ${c.cyan(rec.domain)}\n${kdim("url")}    ${c.white(url)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
   await anchorRecord(a, rec, p.addr, fee, 10, "gateway");
 }
@@ -756,7 +767,8 @@ async function cmdPeer(a: Args) {
   const p = await registryPrep(a); if (!p) return;
   const caps = (a.multi.cap ?? (a.flags.cap ? [String(a.flags.cap)] : [])).filter(Boolean);
   const rec = buildPeerRecord({ priv: p.priv, peer_id: peerId, multiaddrs, caps: caps.length ? caps : undefined, address: p.addr });
-  const fee = Math.max(MIN_FEE_PROPOSE, a.flags.fee !== undefined ? CSD(Number(a.flags.fee)) : MIN_FEE_PROPOSE);
+  const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_PROPOSE;
+  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
   if (a.flags["dry-run"]) { console.log(`${kdim("domain")} ${c.cyan(rec.domain)}\n${kdim("peer")}   ${c.white(peerId)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
   await anchorRecord(a, rec, p.addr, fee, 10, "peer");
 }
@@ -767,7 +779,8 @@ async function cmdIdentity(a: Args) {
   if (sub !== "claim" || !handle) { console.log(warn("usage: ") + c.cyan("cairn identity claim <handle> [--salt <hex>] [--commit-only|--reveal] [--fee 0.25]")); console.log(c.gray("  step 1: --commit-only (saves a salt)  ·  step 2 (next epoch): --reveal --salt <hex>")); return; }
   if (!/^[a-z0-9_.-]{3,32}$/i.test(handle)) { console.log(err("handle must be 3–32 chars [a-z0-9_.-]")); return; }
   const p = await registryPrep(a); if (!p) return;
-  const fee = Math.max(MIN_FEE_PROPOSE, a.flags.fee !== undefined ? CSD(Number(a.flags.fee)) : MIN_FEE_PROPOSE);
+  const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_PROPOSE;
+  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
 
   if (a.flags.reveal) {
     const salt = String(a.flags.salt ?? "");
