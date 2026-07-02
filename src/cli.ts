@@ -23,6 +23,12 @@ const CSD = (v: unknown): number => {
   try { const b = humanToBase(String(v), 8); return b <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(b) : NaN; }
   catch { return NaN; }
 };
+// P8 (Plan 57 B8a review): an unparseable --fee falls back to the default/minimum (safe
+// direction, fee only falls DOWN), but silently: say so, or a typo like `--fee 2e-2` looks
+// accepted while a different fee is used.
+const warnBadFee = (v: unknown, usedBase: number): void => {
+  console.log(warn(`unparseable --fee ${String(v)}: using ${csdToCoins(usedBase)} CSD (pass a plain decimal like 0.25)`));
+};
 
 // ── max-fee sanity guard (UTXO-VALUE-1) ──────────────────────────────────────────────────────
 // A CSD fee is implicit (Σin − Σout) and the chain enforces NO maximum, so a hostile proxy that
@@ -415,6 +421,7 @@ async function cmdSend(a: Args) {
   const addr = await resolveAddr(a); if (!addr) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
   const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : 1_000_000;
   const fee = (Number.isSafeInteger(feeFlag) && feeFlag >= 0) ? feeFlag : 1_000_000;
+  if (a.flags.fee !== undefined && fee !== feeFlag) warnBadFee(a.flags.fee, fee);
   const total = outs.reduce((s, o) => s + o.value, 0);
   console.log(`${kdim("from")}    ${c.cyan(addr)}`);
   for (const o of outs) console.log(`${kdim("to")}      ${c.cyan(o.to)} ${c.gray("→ " + csdToCoins(o.value) + " CSD")}`);
@@ -471,6 +478,7 @@ async function cmdPropose(a: Args) {
   if (!domain || !title) { console.log(warn("usage: ") + c.cyan("cairn propose --domain csd:features --title <t> --body <b> [--link <url>] [--fee <CSD>] [--expires-days N]")); return; }
   const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_PROPOSE;
   const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE);
+  if (a.flags.fee !== undefined && !Number.isSafeInteger(feeFlag)) warnBadFee(a.flags.fee, fee);
   // operator-token path stays available for the instance operator
   if (CAIRN_TOKEN && !(await csd.available())) {
     const sp = spinner("posting via operator token");
@@ -514,6 +522,7 @@ async function cmdSupport(a: Args) {
   if (!/^0x[0-9a-fA-F]{64}$/.test(id)) { console.log(err("proposal id must be 0x…64-hex")); return; }
   const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_ATTEST;
   const fee = Math.max(MIN_FEE_ATTEST, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_ATTEST);
+  if (a.flags.fee !== undefined && !Number.isSafeInteger(feeFlag)) warnBadFee(a.flags.fee, fee);
   const score = Math.max(0, Math.min(100, parseInt(String(a.flags.score ?? 75)) || 0));
   const confidence = Math.max(0, Math.min(100, parseInt(String(a.flags.confidence ?? 60)) || 0));
   if (CAIRN_TOKEN && !(await csd.available())) {
@@ -754,7 +763,8 @@ async function cmdGateway(a: Args) {
   const p = await registryPrep(a); if (!p) return;
   const rec = buildGatewayRecord({ priv: p.priv, url, kind: a.flags.pin ? "pin" : "gateway", address: p.addr });
   const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_PROPOSE;
-  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
+  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE);
+  if (a.flags.fee !== undefined && !Number.isSafeInteger(feeFlag)) warnBadFee(a.flags.fee, fee); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
   if (a.flags["dry-run"]) { console.log(`${kdim("domain")} ${c.cyan(rec.domain)}\n${kdim("url")}    ${c.white(url)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
   await anchorRecord(a, rec, p.addr, fee, 10, "gateway");
 }
@@ -768,7 +778,8 @@ async function cmdPeer(a: Args) {
   const caps = (a.multi.cap ?? (a.flags.cap ? [String(a.flags.cap)] : [])).filter(Boolean);
   const rec = buildPeerRecord({ priv: p.priv, peer_id: peerId, multiaddrs, caps: caps.length ? caps : undefined, address: p.addr });
   const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_PROPOSE;
-  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
+  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE);
+  if (a.flags.fee !== undefined && !Number.isSafeInteger(feeFlag)) warnBadFee(a.flags.fee, fee); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
   if (a.flags["dry-run"]) { console.log(`${kdim("domain")} ${c.cyan(rec.domain)}\n${kdim("peer")}   ${c.white(peerId)}\n${kdim("hash")}   ${c.magenta(rec.payloadHash)}`); console.log(c.gray("\n[dry-run] not signed or submitted")); return; }
   await anchorRecord(a, rec, p.addr, fee, 10, "peer");
 }
@@ -780,7 +791,8 @@ async function cmdIdentity(a: Args) {
   if (!/^[a-z0-9_.-]{3,32}$/i.test(handle)) { console.log(err("handle must be 3–32 chars [a-z0-9_.-]")); return; }
   const p = await registryPrep(a); if (!p) return;
   const feeFlag = a.flags.fee !== undefined ? CSD(a.flags.fee) : MIN_FEE_PROPOSE;
-  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
+  const fee = Math.max(MIN_FEE_PROPOSE, Number.isSafeInteger(feeFlag) ? feeFlag : MIN_FEE_PROPOSE);
+  if (a.flags.fee !== undefined && !Number.isSafeInteger(feeFlag)) warnBadFee(a.flags.fee, fee); // NaN-guard: the old Math.max(MIN, NaN) poisoned the fee on a garbage --fee
 
   if (a.flags.reveal) {
     const salt = String(a.flags.salt ?? "");
