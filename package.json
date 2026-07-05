@@ -41,8 +41,8 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "@inversealtruism/cairnx-core": "0.1.33",
+    "@inversealtruism/cairnx-core": "0.1.34",
     "@inversealtruism/csd-codec": "0.1.15",
-    "@inversealtruism/csd-registry": "0.1.15"
+    "@inversealtruism/csd-registry": "0.1.16"
   }
 }
