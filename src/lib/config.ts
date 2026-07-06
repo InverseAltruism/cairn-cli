@@ -10,8 +10,9 @@ export const CAIRN_CSD = process.env.CAIRN_CSD ?? "csd"; // the user's installed
 export const CAIRN_ADDR = process.env.CAIRN_ADDR ?? ""; // optional: your public addr20 (skips deriving it from csd)
 
 export const CSD_PER_COIN = 100_000_000;
-export const MIN_FEE_PROPOSE = 25_000_000; // 0.25 CSD
-export const MIN_FEE_ATTEST = 5_000_000; // 0.05 CSD
+// Consensus fee floors come from the pinned codec (shared-core de-dup) — cairnx.ts already
+// imports MIN_FEE_PROPOSE from the same package; re-exported here so callers keep one import site.
+export { MIN_FEE_PROPOSE, MIN_FEE_ATTEST } from "@inversealtruism/csd-codec"; // 0.25 / 0.05 CSD
 
 export function csdToCoins(base: number): string {
   return (base / CSD_PER_COIN).toLocaleString(undefined, { maximumFractionDigits: 4 });

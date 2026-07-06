@@ -7,6 +7,9 @@ import * as csd from "./lib/csd.js";
 import { buildCommitment } from "./lib/item.js";
 import { buildGatewayRecord, buildPeerRecord, buildIdentityCommit, buildIdentityReveal } from "@inversealtruism/csd-registry";
 import { canonicalJson } from "@inversealtruism/csd-codec";
+// epochOf/EPOCH_LEN from the pinned core (shared-core de-dup): 1 epoch = EPOCH_LEN (30) blocks,
+// so expires-epoch math never drifts from the resolver's if the epoch length ever gates.
+import { epochOf, EPOCH_LEN } from "@inversealtruism/cairnx-core";
 import { cairnxGet, activeCairnxBase, defaultBases, buildTransferRecord, humanToBase, baseToHuman, CAIRNX_DOMAIN, CAIRNX_ANCHOR_FEE, TICKER_RE, NAME_RE } from "./lib/cairnx.js";
 import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
@@ -41,6 +44,11 @@ const warnBadFee = (v: unknown, usedBase: number): void => {
 // Returns null if the fee is acceptable, or a human error string to print and abort.
 const MAX_FEE_ABS = 100_000_000;          // 1 CSD absolute floor — every honest fee is well under this
 const MAX_FEE_VALUE_FRACTION = 0.25;      // …and ≤ 25% of the value moved
+// KEEP-DISTINCT: this is NOT csd-tx `feeCap` (csd-sdk packages/tx/src/index.ts — max(1 CSD, 10% of
+// the INPUT total), the builders' explicit-fee backstop). The CLI can't see verified input values
+// (it drives an external `csd` binary), so this is a deliberate CLI-level sanity bound on the fee
+// vs the VALUE MOVED (25%), with a --max-fee escape hatch. Different denominator, different layer —
+// do not "unify" them.
 function feeCap(txValue: number, a: Args): number {
   if (a.flags["max-fee"] !== undefined) { const m = CSD(a.flags["max-fee"]); if (Number.isSafeInteger(m) && m >= 0) return m; }
   return Math.max(MAX_FEE_ABS, Math.floor(Math.max(0, txValue) * MAX_FEE_VALUE_FRACTION));
@@ -506,7 +514,7 @@ async function cmdPropose(a: Args) {
   const tip = await api.tipHeight().catch(() => 0);
   const days = Math.max(1, parseInt(String(a.flags["expires-days"] ?? 30)) || 30);
   const sp = spinner("csd signs → submit");
-  const r = await signAndSubmit(["propose", "--domain", domain, "--payload-hash", payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", input]);
+  const r = await signAndSubmit(["propose", "--domain", domain, "--payload-hash", payloadHash, "--uri", uri, "--expires-epoch", String(epochOf(tip) + days * 24), "--fee", String(fee), "--change", addr, "--input", input]);
   sp.stop();
   if (!r.ok) { console.log(err(r.error || "failed")); return; }
   console.log(ok(`proposed  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
@@ -734,7 +742,7 @@ async function anchorRecord(a: Args, rec: { domain: string; content: object; pay
   if (!input) return false;
   const tip = await api.tipHeight().catch(() => 0);
   const sp = spinner("csd signs → submit");
-  const r = await signAndSubmit(["propose", "--domain", rec.domain, "--payload-hash", rec.payloadHash, "--uri", uri, "--expires-epoch", String(Math.floor(tip / 30) + days * 24), "--fee", String(fee), "--change", addr, "--input", input]);
+  const r = await signAndSubmit(["propose", "--domain", rec.domain, "--payload-hash", rec.payloadHash, "--uri", uri, "--expires-epoch", String(epochOf(tip) + days * 24), "--fee", String(fee), "--change", addr, "--input", input]);
   sp.stop();
   if (!r.ok) { console.log(err(r.error || "failed")); return false; }
   console.log(ok(`${label} anchored  ${c.cyan(r.txid!)}`) + c.gray("  (signed by your csd wallet)"));
@@ -952,7 +960,7 @@ async function cmdTokenSend(a: Args) {
   if (!input) return;
   const tip = await api.tipHeight().catch(() => 0);
   const sp3 = spinner("csd signs → submit");
-  const r = await signAndSubmit(["propose", "--domain", CAIRNX_DOMAIN, "--payload-hash", built.payloadHash, "--uri", built.uri, "--expires-epoch", String(Math.floor(tip / 30) + 24), "--fee", String(CAIRNX_ANCHOR_FEE), "--change", from, "--input", input]);
+  const r = await signAndSubmit(["propose", "--domain", CAIRNX_DOMAIN, "--payload-hash", built.payloadHash, "--uri", built.uri, "--expires-epoch", String(epochOf(tip) + 24), "--fee", String(CAIRNX_ANCHOR_FEE), "--change", from, "--input", input]);
   sp3.stop();
   console.log(r.ok ? ok(`transfer anchored  ${c.cyan(r.txid!)}`) + c.gray("  (tokens move when it mines — check `cairn tokens`)") : err(r.error || "failed"));
 }
@@ -982,8 +990,9 @@ async function cmdName(a: Args) {
   // computed from the chain tip (1 epoch = 30 blocks · 120s target ⇒ ~1h per epoch).
   if (r.paidThroughEpoch != null) {
     const tip = await api.tipHeight().catch(() => 0);
-    const blocksLeft = (Number(r.paidThroughEpoch) + 1) * 30 - tip;
-    const eta = !tip ? "" : blocksLeft <= 0 ? " · " + "EXPIRED" : ` · expires in ~${blocksLeft >= 720 ? (blocksLeft / 720).toFixed(1) + " days" : Math.max(1, Math.round(blocksLeft / 30)) + "h"}`;
+    const BLOCKS_PER_DAY = 720; // display-only day math (24 epochs · EPOCH_LEN blocks at the 120s target)
+    const blocksLeft = (Number(r.paidThroughEpoch) + 1) * EPOCH_LEN - tip;
+    const eta = !tip ? "" : blocksLeft <= 0 ? " · " + "EXPIRED" : ` · expires in ~${blocksLeft >= BLOCKS_PER_DAY ? (blocksLeft / BLOCKS_PER_DAY).toFixed(1) + " days" : Math.max(1, Math.round(blocksLeft / EPOCH_LEN)) + "h"}`;
     row("lease", `${c.white("paid through epoch " + Number(r.paidThroughEpoch))}${blocksLeft <= 0 && tip ? "  " + err("EXPIRED") : c.gray(eta)}`);
   } else row("lease", c.gray("— (no lease data from this API)"));
   if (r.locked) row("locked", c.gray("yes — a sale/transfer is in flight"));
