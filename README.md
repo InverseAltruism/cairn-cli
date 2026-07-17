@@ -98,6 +98,22 @@ cairn name inverse                      # one name: owner · lease · open offer
 token layer; anchoring it on-chain costs the 0.25 CSD propose fee (printed before anything
 signs, and `--dry-run` shows the exact canonical record + hash without signing).
 
+The human-to-base scale uses the token's `decimals` from the (unauthenticated) CairnX read API.
+The interactive path prints and confirms the exact base-unit integer, but automation skips that
+prompt, so two flags let scripted / piped sends stay fund-safe against a lying or MITM'd gateway:
+
+```bash
+cairn token-send --ticker CAIRN --to 0x… --amount 150000000 --base-units   # --amount is base units
+cairn token-send --ticker CAIRN --to 0x… --amount 1.5 --expect-decimals 8   # refuse if decimals ≠ 8
+```
+
+- **`--base-units`** interprets `--amount` as raw base units directly, bypassing the untrusted
+  `decimals` scale entirely. What you type is exactly what is anchored, so an over-reported
+  `decimals` cannot silently inflate the amount. This is the recommended path for `--yes` / piped
+  automation.
+- **`--expect-decimals <N>`** is a fail-closed second source: if the served `decimals` is not `N`,
+  the send is refused before any scaling.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Purpose |

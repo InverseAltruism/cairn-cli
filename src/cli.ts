@@ -10,7 +10,7 @@ import { canonicalJson } from "@inversealtruism/csd-codec";
 // epochOf/EPOCH_LEN from the pinned core (shared-core de-dup): 1 epoch = EPOCH_LEN (30) blocks,
 // so expires-epoch math never drifts from the resolver's if the epoch length ever gates.
 import { epochOf, EPOCH_LEN } from "@inversealtruism/cairnx-core";
-import { cairnxGet, activeCairnxBase, defaultBases, buildTransferRecord, humanToBase, baseToHuman, CAIRNX_DOMAIN, CAIRNX_ANCHOR_FEE, TICKER_RE, NAME_RE } from "./lib/cairnx.js";
+import { cairnxGet, activeCairnxBase, defaultBases, buildTransferRecord, humanToBase, baseToHuman, CAIRNX_DOMAIN, CAIRNX_ANCHOR_FEE, TICKER_RE, NAME_RE, MAX_AMOUNT } from "./lib/cairnx.js";
 import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
 import { c, banner, bannerAnimated, rule, badge, bar, csd as csdFmt, ok, warn, err, key as kdim, pad, spinner, sleep, isTty, anim, clearScreen, cursorHome, san } from "./lib/ui.js";
@@ -140,23 +140,23 @@ async function resolveAddr(a: Args): Promise<string | null> {
       console.log(warn(`cached address ${c.cyan(san(cached))} does NOT match your csd wallet ${c.cyan(real)}`) + c.gray(" — using the wallet's address and refreshing the cache (a tampered config can't redirect you)."));
     saveLocalConfig({ address: real }); return real;
   }
-  // No change address configured. Audit H-2: re-deriving from the privkey on EVERY call runs
-  // `csd wallet recover --privkey <KEY>`, putting the key on the argv (readable via /proc on a
-  // shared host). Avoid that — prefer a previously-cached address; only DERIVE when we have
-  // nothing else (then cache it + warn once, and nudge the user to set a change address so the
-  // key is never needed again, which also restores the F13 anti-poison cross-check above).
+  // No change address configured. Audit H-2 / L7: deriving from the privkey is now IN-PROCESS
+  // (csd.deriveAddr → addrFromPriv), so the key never touches an argv — the old key-on-argv exposure
+  // is gone. We still prefer a previously-cached address and only DERIVE when we have nothing else
+  // (then cache it + nudge the user to set a change address, which also restores the F13 anti-poison
+  // cross-check above), but a re-derive on a subsequent run is harmless (fast, no exposure).
   if (cached && /^0x[0-9a-fA-F]{40}$/.test(cached)) return cached;
   if (cfg?.default_privkey) {
-    const real = await csd.deriveAddr(cfg.default_privkey);
+    const real = csd.deriveAddr(cfg.default_privkey);
     if (real && /^0x[0-9a-fA-F]{40}$/.test(real)) {
       const cached2 = saveLocalConfig({ address: real });
-      console.log(warn("derived your address from the wallet key once.") + c.gray(" " + csd.keyExposureWarning));
-      // CLI-C2-DERIVEADDR: if the cache write FAILED (read-only HOME, unwritable CAIRN_CLI_CONFIG, …)
-      // the "derive at most once" guarantee is broken — every subsequent call would re-derive and
-      // re-expose the key on the csd argv. Surface it so the user can set a change address / CAIRN_ADDR.
+      console.log(warn("derived your address from the wallet key.") + c.gray(" " + csd.keyExposureWarning));
+      // CLI-C2-DERIVEADDR: a failed cache write (read-only HOME, unwritable CAIRN_CLI_CONFIG, …) is no
+      // longer a security issue (the in-process derive exposes nothing), but it does mean we re-derive
+      // every run and lose the F13 anti-poison cross-check — nudge the user to set a change address.
       if (!cached2) console.log(warn("could NOT cache your address (config write failed)") +
         c.gray(" — set a change address (") + c.cyan("csd wallet init --privkey <key>") + c.gray(") or ") + c.cyan("CAIRN_ADDR") +
-        c.gray(", otherwise the key is re-derived (and briefly re-exposed on the csd argv) every run."));
+        c.gray(" so cairn resolves it without the key (and the F13 anti-poison check is restored)."));
       return real;
     }
   }
@@ -687,6 +687,7 @@ async function help() {
   cmd("tokens", "[address]", "token balances + .csd names (default: your address)");
   cmd("token-info", "<TICKER>", "supply · minted · mint mode · top-10 holders (alias: token)");
   cmd("token-send", "--ticker T --to 0x…40 --amount <n>", "send tokens (anchors a 0.25 CSD transfer record; --dry-run, --yes)");
+  cmd("", "", "  --base-units: --amount is base units (skips the untrusted decimals scale; safe for automation) · --expect-decimals N: refuse if the served decimals ≠ N");
   cmd("names", "[address]", "owned .csd names");
   cmd("name", "<name>", "one name: owner · lease · open offer");
   console.log(c.gray("\n  lenses (--sort): " + Object.keys(LENS).join(" · ")));
@@ -910,32 +911,65 @@ async function confirmSend(q: string): Promise<boolean> {
   return /^y(es)?$/i.test(ans.trim());
 }
 
+// Parse a plain non-negative base-unit integer for --base-units: digits only, no sign, no decimal
+// point, no exponent, no hex. Returns null on anything else (the caller refuses). The upper bound
+// (MAX_AMOUNT) is enforced by the caller so the error message can name the 96-bit limit.
+function parseBaseUnits(s: string): bigint | null {
+  const str = String(s).trim();
+  if (!/^[0-9]+$/.test(str) || str.length > 40) return null; // MAX_AMOUNT is 29 digits; cap before BigInt
+  try { return BigInt(str); } catch { return null; }
+}
+
 async function cmdTokenSend(a: Args) {
   const ticker = String(a.flags.ticker ?? "").toUpperCase();
   const to = String(a.flags.to ?? "");
   const amountStr = String(a.flags.amount ?? "");
-  if (!ticker || !a.flags.to || a.flags.amount === undefined) { console.log(warn("usage: ") + c.cyan("cairn token-send --ticker CAIRN --to 0x…40 --amount 1.5 [--dry-run] [--yes]")); return; }
+  if (!ticker || !a.flags.to || a.flags.amount === undefined) { console.log(warn("usage: ") + c.cyan("cairn token-send --ticker CAIRN --to 0x…40 --amount 1.5 [--base-units] [--expect-decimals N] [--dry-run] [--yes]")); return; }
   if (!TICKER_RE.test(ticker)) { console.log(err(`bad ticker: ${san(ticker)}`)); return; }
   if (!/^0x[0-9a-fA-F]{40}$/.test(to)) { console.log(err(`bad recipient: ${san(to)}`)); return; }
-  // CLI-C5-DECIMALS: `decimals` drives the human→base scale but is reported by an UNauthenticated
-  // CairnX read API (no signature/SPV) — a hostile gateway over-reporting it silently inflates the
-  // MAGNITUDE of your transfer. So: (1) when not pinned to a single CAIRNX_API, cross-check decimals
-  // across the default bases and refuse on disagreement (dual-source discipline); (2) always show +
-  // confirm the exact base-unit integer so a wrong scale is visible before signing.
+  // CLI-C5-DECIMALS (F10): `decimals` drives the human→base scale but is reported by an UNauthenticated
+  // CairnX read API (no signature/SPV) — a hostile/pinned/MITM'd gateway over-reporting it silently
+  // inflates the MAGNITUDE of your transfer. The interactive path prints + confirms the exact base-unit
+  // integer, but a --yes / piped run skips that prompt, so automation could over-send unseen. Defenses:
+  //   • --base-units: interpret --amount as BASE UNITS directly, bypassing the untrusted decimals scale
+  //     ENTIRELY — the fund-safe path for automation. What you type is exactly what is anchored; no
+  //     decimals multiply, so a lying `decimals` cannot inflate the amount.
+  //   • --expect-decimals <N>: a fail-closed second source — if the served decimals != N, REFUSE.
+  //   • when not pinned to a single CAIRNX_API, cross-check decimals across the default bases (scaled path).
+  //   • always show the exact base-unit integer so a wrong scale is visible before signing.
   const t = await cairnxGet(`/token/${encodeURIComponent(ticker)}`).catch((e: any) => { console.log(e.status === 404 ? err(`unknown token ${ticker}`) : err(san(e.message))); return null; });
   if (!t) return;
   const decimals = Number(t.decimals);
-  const bases = defaultBases();
-  if (bases.length > 1) {
-    const seen = await Promise.all(bases.map((b) => cairnxGet(`/token/${encodeURIComponent(ticker)}`, [b]).then((x: any) => Number(x?.decimals)).catch(() => null)));
-    const consistent = seen.filter((d): d is number => Number.isInteger(d));
-    if (consistent.length >= 2 && new Set(consistent).size > 1) {
-      console.log(err(`CairnX sources DISAGREE on ${ticker} decimals (${[...new Set(consistent)].join(" vs ")}) — refusing to scale the amount against an ambiguous decimals (pin CAIRNX_API to a trusted base).`));
-      return;
-    }
+  const baseUnits = a.flags["base-units"] === true;
+  // --expect-decimals: assert the served (untrusted) decimals matches what you expect, else fail closed.
+  // Fund-load-bearing on the scaled path; a harmless no-op assertion under --base-units (kept for clarity).
+  const expRaw = a.flags["expect-decimals"];
+  if (expRaw !== undefined) {
+    const exp = typeof expRaw === "string" && /^[0-9]+$/.test(expRaw) ? Number(expRaw) : NaN;
+    if (!Number.isInteger(exp)) { console.log(err("--expect-decimals must be a non-negative integer (e.g. --expect-decimals 8)")); return; }
+    if (decimals !== exp) { console.log(err(`CairnX reports ${ticker} has ${san(String(t.decimals))} decimals, not the ${exp} you asserted with --expect-decimals — refusing (the served decimals scales your amount; a wrong value silently changes the magnitude).`)); return; }
   }
   let amount: bigint;
-  try { amount = humanToBase(amountStr, decimals); } catch (e: any) { console.log(err(san(e.message))); return; }
+  if (baseUnits) {
+    // Root fix: --amount is already in base units. No decimals multiply — an over-reported scale can't inflate it.
+    const bu = parseBaseUnits(amountStr);
+    if (bu === null) { console.log(err(`--base-units amount "${san(amountStr)}" must be a plain non-negative integer (base units, no decimal point)`)); return; }
+    if (bu > MAX_AMOUNT) { console.log(err("amount exceeds the 96-bit token-amount limit")); return; }
+    amount = bu;
+  } else {
+    // Scaled path: human units × 10^decimals. The scale is UNauthenticated — cross-check it across the
+    // default bases when unpinned and refuse on disagreement (dual-source discipline).
+    const bases = defaultBases();
+    if (bases.length > 1) {
+      const seen = await Promise.all(bases.map((b) => cairnxGet(`/token/${encodeURIComponent(ticker)}`, [b]).then((x: any) => Number(x?.decimals)).catch(() => null)));
+      const consistent = seen.filter((d): d is number => Number.isInteger(d));
+      if (consistent.length >= 2 && new Set(consistent).size > 1) {
+        console.log(err(`CairnX sources DISAGREE on ${ticker} decimals (${[...new Set(consistent)].join(" vs ")}) — refusing to scale the amount against an ambiguous decimals (pin CAIRNX_API to a trusted base, or pass --base-units).`));
+        return;
+      }
+    }
+    try { amount = humanToBase(amountStr, decimals); } catch (e: any) { console.log(err(san(e.message))); return; }
+  }
   if (amount <= 0n) { console.log(err("amount must be > 0")); return; }
   const from = await resolveAddr(a); if (!from) { console.log(err("could not resolve your address — pass --address or run ") + c.cyan("cairn setup")); return; }
   // balance check against the same state the resolver will apply the transfer to
@@ -946,7 +980,7 @@ async function cmdTokenSend(a: Args) {
   // clear-print exactly what will be anchored before anything signs — the EXACT base-unit integer is
   // emphasized on its own line (CLI-C5: a wrong API-reported `decimals` shows up here as a magnitude).
   console.log(`${kdim("send")}    ${c.white(tokAmt(amount.toString(), decimals))} ${c.cyan(ticker)}`);
-  console.log(`${kdim("amount")}  ${c.white(c.bold(amount.toString()))} ${c.gray(`base units · ${decimals} decimals (from the CairnX read API — verify this magnitude)`)}`);
+  console.log(`${kdim("amount")}  ${c.white(c.bold(amount.toString()))} ${c.gray(baseUnits ? `base units (given directly via --base-units; the CairnX decimals scale was bypassed)` : `base units · ${decimals} decimals (from the CairnX read API — verify this magnitude)`)}`);
   console.log(`${kdim("to")}      ${c.cyan(to.toLowerCase())}`);
   console.log(`${kdim("from")}    ${c.cyan(from.toLowerCase())} ${c.gray(`· ${ticker} balance ${tokAmt(avail.toString(), decimals)}`)}`);
   console.log(`${kdim("record")}  ${c.white(san(built.uri))}`);
