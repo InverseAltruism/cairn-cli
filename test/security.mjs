@@ -8,7 +8,7 @@
 // the parent must NOT block while the child runs its requests. No real chain, no spending.
 import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
-import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -298,6 +298,44 @@ console.log("\n— H-7: a proxy-only 'mined' reply is not asserted as confirmed-
 // We assert the wording: the CLI must flag UNCONFIRMED rather than print a bare 'confirmed on-chain'.
 const h7 = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1", "--wait"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED })).out;
 check("without CAIRN_RPC, a 'mined' claim is softened (not a bare trustless 'confirmed on-chain')", !/confirmed on-chain(?!.*independent)/i.test(h7) || /proxy reports mined|set CAIRN_RPC/i.test(h7));
+
+// ── L7: address derivation is IN-PROCESS (the wallet key never reaches the csd argv) ──
+// Pre-L7 `deriveAddr` shelled out `csd wallet recover --privkey <KEY>`, putting the key on a
+// /proc-visible argv. The fix derives the addr20 in-process via csd-crypto addrFromPriv. We assert
+// (a) a GOLDEN VECTOR: the in-process derive equals the canonical addr20 `csd wallet recover` would
+// produce for a shared privkey (byte-identity matters — the change address is fund-load-bearing), and
+// (b) the CLI's derive path NEVER spawns `csd wallet recover` (a trap mock records its argv if it is).
+console.log("\n— L7: address derivation is in-process; the wallet key never reaches the csd argv —");
+const { addrFromPriv } = await import("@inversealtruism/csd-crypto");
+const { deriveAddr } = await import("../dist/lib/csd.js");
+// Shared test vector: privkey 0x…01 → its canonical CSD_SIG_V1 addr20 (hash160 of the compressed
+// pubkey). This is exactly what `csd wallet recover --privkey 0x…01` prints (same crypto contract).
+const GOLDEN_PRIV = "0x" + "00".repeat(31) + "01";
+const GOLDEN_ADDR = "0x751e76e8199196d454941c45d1b3a323f1433bd6";
+check("golden vector: deriveAddr(0x…01) == the canonical wallet addr20", deriveAddr(GOLDEN_PRIV) === GOLDEN_ADDR);
+check("golden vector: addrFromPriv agrees (byte-identical derivation)", addrFromPriv(GOLDEN_PRIV) === GOLDEN_ADDR);
+// A TRAP mock csd: config exposes a privkey but NO change addr (so resolveAddr must derive); if the
+// CLI ever calls `wallet recover`, the mock records its full argv (the key) to SENTINEL — proving the
+// key hit an argv. Post-L7 the derive is in-process, so SENTINEL must NOT exist.
+const SENTINEL = join(tmp, "argv-leak.txt");
+const trapCsd = join(tmp, "csd-trap");
+writeFileSync(trapCsd, `#!/usr/bin/env node
+const fs = require("node:fs");
+const a = process.argv.slice(2);
+if (a[0] === "--version") { process.stdout.write("csd-mock 0.0.0\\n"); process.exit(0); }
+if (a[0] === "wallet" && a[1] === "config") { process.stdout.write(JSON.stringify({ default_privkey: "${GOLDEN_PRIV}" })); process.exit(0); }
+if (a[0] === "wallet" && a[1] === "recover") {
+  try { fs.writeFileSync(process.env.SENTINEL, process.argv.join(" ")); } catch {}
+  process.stdout.write("addr20: 0x" + "de".repeat(20) + "\\n"); process.exit(0);
+}
+process.stderr.write("mock csd: unknown command\\n"); process.exit(1);
+`);
+chmodSync(trapCsd, 0o755);
+const derCfg = join(tmp, "derive-cfg.json"); // fresh path → no cached address → forces the derive branch
+const derOut = (await run(["address"], { CAIRN_API: API, CAIRN_CSD: trapCsd, CAIRN_ADDR: "", CAIRN_CLI_CONFIG: derCfg, SENTINEL })).out;
+const derLine = derOut.trim().split("\n").map((l) => l.trim()).filter((l) => /^0x[0-9a-fA-F]{40}$/.test(l)).pop();
+check("`address` resolves to the in-process-derived addr20 (not a shelled-out one)", derLine === GOLDEN_ADDR);
+check("`csd wallet recover --privkey` was NEVER invoked (no key on any argv)", !existsSync(SENTINEL));
 
 server.close();
 rpcServer.close();

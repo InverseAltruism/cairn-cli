@@ -13,18 +13,18 @@ Default API base https://cairn-substrate.com, a Cairn board instance whose publi
 
 ## Architecture
 
-Zero runtime deps beyond three pinned @inversealtruism packages; Node >= 20; plain tsc build to dist/ (no bundler). src/ (~1,660 lines):
+Zero runtime deps beyond four pinned @inversealtruism packages; Node >= 20; plain tsc build to dist/ (no bundler). src/ (~1,660 lines):
 
 - `cli.ts` (~1,000 lines): argv parser, all command handlers, and the money-safety guards:
   - CSD() exact decimal-string conversion (no floats on money, ever; NaN on garbage)
   - feeCap/feeSanity (fee <= max(1 CSD, 25% of value moved); --max-fee overrides). KEEP-DISTINCT from csd-tx's feeCap (different denominator/layer; marked in code, do not unify).
   - pickAndShow(): picks one confirmed UTXO from the proxy, cross-verifies its value against an independent CAIRN_RPC node (refuses on mismatch), always displays input/change/implied fee, loud UNVERIFIED warning otherwise.
-  - resolveAddr(): --address -> CAIRN_ADDR -> wallet default_change_addr20 (authoritative, anti-poison cross-check) -> cache -> last-resort one-time key derivation (argv-exposure warned).
+  - resolveAddr(): --address -> CAIRN_ADDR -> wallet default_change_addr20 (authoritative, anti-poison cross-check) -> cache -> last-resort IN-PROCESS key derivation (csd-crypto addrFromPriv; L7: no key on argv).
   - signAndSubmit(): evidence-based success; authoritative txid is the LOCALLY signed one; divergent proxy txid = hard failure; error strings never trusted.
   - freshTip(): refuses to build value txs against a stale/frozen tip (fail-closed on stale; --force-stale override).
   - sameHost/canonHost: "trustless" claims refused when CAIRN_RPC shares a machine with CAIRN_API.
 - `lib/api.ts`: Cairn HTTP client (redirect:"error" so the operator token can't leak on a 30x), proxy bridge, independent-node checks.
-- `lib/csd.ts`: trusted-csd-binary resolution (CAIRN_CSD must be absolute; canonical locations beat PATH; refuses world-writable/transient/cwd; symlink-TOCTOU resolved; execFile, no shell).
+- `lib/csd.ts`: trusted-csd-binary resolution (CAIRN_CSD must be absolute; canonical locations beat PATH; refuses world-writable/transient/cwd; symlink-TOCTOU resolved; execFile, no shell). deriveAddr() derives the addr20 in-process via csd-crypto addrFromPriv (L7: the privkey never reaches an argv).
 - `lib/cairnx.ts`: CairnX read client with base fallback; buildTransferRecord via cairnx-core transfer() + csd-codec canonicalJson (single canonicaliser, byte-identical to the resolver); exact humanToBase/baseToHuman string/BigInt math.
 - `lib/config.ts`: env config; local cache ~/.config/cairn-cli/config.json holds the PUBLIC address only, never a key (0700/0600).
 - `lib/item.ts`: canonical item record + integrity commitment: stableStringify (recursively sorted keys, no whitespace) -> sha256 payload_hash; buildCommitment/verifyContent back `verify <id>` (no salt; the board is public, hash is tamper-evidence not secrecy).
@@ -34,7 +34,7 @@ Zero runtime deps beyond three pinned @inversealtruism packages; Node >= 20; pla
 
 Browse (no key needed): domains, ls|list|top [domain] [--window] [--sort] [--json], watch, recent, show <id>, verify <id> (recompute sha256 locally; trustless with independent CAIRN_RPC), wall, network|stats, quests, profile <addr>, leaderboard.
 Wallet (drives csd): setup|doctor, address|whoami|balance, send --to 0x..40 --amount <CSD> [--output a:v ...] [--fee] [--max-fee] [--dry-run] [--wait] [--force-stale], propose|post, support <id> --fee <CSD>, wall place "<msg>".
-CairnX: tokens [address], token-info <TICKER>, token-send --ticker T --to 0x..40 --amount <n> [--dry-run] [--yes] (the ONE CairnX write: anchors a canonical transfer record as a 0.25 CSD Propose), names [address], name <name>.
+CairnX: tokens [address], token-info <TICKER>, token-send --ticker T --to 0x..40 --amount <n> [--base-units] [--expect-decimals <N>] [--dry-run] [--yes] (the ONE CairnX write: anchors a canonical transfer record as a 0.25 CSD Propose), names [address], name <name>.
 L3 registry (in-process signing): gateway register, peer announce, identity claim [--commit-only|--reveal --salt <hex>].
 
 Fee floors: propose >= 0.25 CSD, attest >= 0.05 CSD (imported from csd-codec). Default send fee 0.01 CSD. Every write path: fee sanity -> fresh-tip gate -> pickAndShow -> csd signs -> proxy submit -> evidence-based confirm.
@@ -83,9 +83,9 @@ npm publish (public) with a transient mktemp --userconfig token, deleted immedia
 
 - Two-mempool trap (real bug, fixed): csd's auto-submit targets csd's own configured node, whose mempool may not be the one the board's miner-connected node reads, so a tx could sit in the wrong mempool and never appear on the board. The CLI therefore ALWAYS submits via the Cairn proxy itself (see the comment above signAndSubmit in cli.ts).
 - Residual trust assumption, by design and documented in code (CLI-C1 in cli.ts): with CAIRN_RPC unset the CLI cannot independently recompute input values (it ships no codec for that), so the picked input is proxy-trusted; the mitigations are the loud UNVERIFIED warnings plus the fee-sanity cap. The paired hard rule (CLI-C3): the locally signed txid is the only one ever trusted; a divergent proxy-reported txid is a hard failure.
-- Key-on-argv (H-2 in code comments): csd wallet recover --privkey is /proc-visible; derivation happens at most once and is cached; failed cache writes are loudly surfaced. Advise users to set a change address.
+- Key-on-argv (H-2 in code comments; FIXED, L7): address derivation from the wallet key is now IN-PROCESS via csd-crypto addrFromPriv (byte-identical to `csd wallet recover`), so the privkey never reaches a /proc-visible csd argv. Still a last resort (prefer a configured change address, which also restores the F13 anti-poison cross-check), and still cached, but a re-derive is now harmless.
 - Hostile-API display DoS: read-API amounts parse defensively (0n on garbage).
-- Token decimals come from an unauthenticated read API: cross-checked across bases, refused on disagreement, exact base-unit integer always printed before signing.
+- Token decimals come from an unauthenticated read API (CLI-C5 / F10): the human->base scale is only as trustworthy as the gateway. The interactive path cross-checks across bases, refuses on disagreement, and prints the exact base-unit integer before signing; automation (--yes / piped) skips the confirm prompt, so `token-send --base-units` interprets --amount as raw base units (bypassing the untrusted scale entirely - the fund-safe automation path), and `--expect-decimals <N>` fails closed if the served decimals differ.
 - send needs ONE confirmed UTXO covering amount+fee; fragmented wallets must consolidate first (a recurring user pain point).
 - All animation gates on TTY; piped output and e2e regexes depend on that; no unguarded ANSI.
 
@@ -95,4 +95,4 @@ Version 0.3.19, branch master. Snapshot HEAD f08b067 (re-pin cairnx-core 0.1.35;
 
 ## Cross-repo map
 
-Depends on (exact pins): cairnx-core 0.1.35, csd-codec 0.1.15, csd-registry 0.1.16 (all @inversealtruism packages published from the csd-sdk workspace). Runtime couplings: the user's installed upstream csd binary (github.com/compute-substrate/compute-substrate) does all wallet signing; a Cairn board instance's /api + /api/rpc proxy (a 401 means a password-gated instance); the CairnX state API. The csd-sdk side runs a check-consumer-pins script that validates this repo's pins from the other direction (referenced in this repo's commit history). Sibling consumer @inversealtruism/cairn-sdk pins overlapping csd-sdk packages; pin drift between the two consumers is common after a csd-sdk publish, so check both.
+Depends on (exact pins): cairnx-core, csd-codec, csd-registry, and csd-crypto (all @inversealtruism packages published from the csd-sdk workspace; verify exact versions in package.json). csd-crypto (added as a DIRECT pin for L7's in-process addrFromPriv) must stay at the exact version csd-registry transitively pins - do not float, since it handles key material. Runtime couplings: the user's installed upstream csd binary (github.com/compute-substrate/compute-substrate) does all wallet signing; a Cairn board instance's /api + /api/rpc proxy (a 401 means a password-gated instance); the CairnX state API. The csd-sdk side runs a check-consumer-pins script that validates this repo's pins from the other direction (referenced in this repo's commit history). Sibling consumer @inversealtruism/cairn-sdk pins overlapping csd-sdk packages; pin drift between the two consumers is common after a csd-sdk publish, so check both.

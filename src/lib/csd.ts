@@ -15,6 +15,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { statSync, realpathSync } from "node:fs";
 import { isAbsolute, join, dirname, delimiter } from "node:path";
+// addrFromPriv is the SAME secp256k1 + hash160(compressed-pubkey) derivation `csd wallet recover`
+// uses (CSD_SIG_V1), so an in-process derive is byte-identical to the wallet's addr20 — and the key
+// never touches an argv (audit H-2). Pinned exactly to the version csd-registry transitively pins
+// (0.1.15), not floated: this loads key material, so the supply-chain surface stays fixed.
+import { addrFromPriv } from "@inversealtruism/csd-crypto";
 const pexec = promisify(execFile);
 
 // Back-compat hint (the configured name/path); real resolution is resolveCsdBin().
@@ -111,10 +116,13 @@ export async function run(args: string[]): Promise<CsdResult> {
 export async function available(): Promise<boolean> { const bin = resolveCsdBin(); if (!bin.path) return false; try { await pexec(bin.path, ["--version"], { timeout: 5000 }); return true; } catch { return false; } }
 // The user's csd wallet config (default_privkey / default_rpc_url / …). null if csd absent.
 export async function walletConfig(): Promise<any | null> { const r = await run(["wallet", "config"]); if (!r.ok) return null; try { return JSON.parse(r.stdout); } catch { return null; } }
-// Derive the public addr20 from a privkey via `csd wallet recover`.
-// SECURITY (audit H-2): this puts --privkey on the csd argv, briefly readable via /proc on a
-// shared host. It is a LAST resort — resolveAddr() only calls it when the wallet has no
-// default_change_addr20 AND we have no cached address, and the result is cached so it happens at
-// most once. Callers surface keyExposureWarning and recommend setting a change address.
-export async function deriveAddr(priv: string): Promise<string | null> { const r = await run(["wallet", "recover", "--privkey", priv]); const m = r.stdout.match(/addr20:\s*(0x[0-9a-fA-F]{40})/i); return m ? m[1] : null; }
-export const keyExposureWarning = "deriving your address from the wallet key briefly exposes it on the `csd` command line (readable via /proc on a shared host). Set a change address once — `csd wallet init --privkey <key>` — so cairn never needs the key again.";
+// Derive the public addr20 from a privkey IN-PROCESS (audit H-2 fix, L7). The old path shelled out
+// `csd wallet recover --privkey <KEY>`, putting the key on the csd argv (briefly /proc-visible on a
+// shared host) and re-exposing it on a failed cache write; addrFromPriv (the SAME crypto `csd wallet
+// recover` runs) derives the identical addr20 without the key ever leaving this process (no spawn, no
+// argv). It stays a LAST resort — resolveAddr() only calls it when the wallet has no
+// default_change_addr20 AND we have no cached address — but the argv exposure is now gone.
+export function deriveAddr(priv: string): string | null {
+  try { const a = addrFromPriv(priv); return /^0x[0-9a-fA-F]{40}$/.test(a) ? a : null; } catch { return null; }
+}
+export const keyExposureWarning = "cairn had no change address configured, so it derived your address from the wallet key (in-process; the key is never put on a command line or networked). Set a change address once — `csd wallet init --privkey <key>` — so cairn never needs the key at all.";

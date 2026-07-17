@@ -111,7 +111,7 @@ check("HTTP 404 from a reachable base is authoritative (never falls through to B
 
 // ── the built CLI vs a mock CairnX API (read commands + the token-send dry-run path) ──
 console.log("\n— CLI vs mock CairnX API —");
-const ME = "0x" + "aa".repeat(20), YOU = "0x" + "bb".repeat(20);
+const ME = "0x" + "aa".repeat(20), YOU = "0x" + "bb".repeat(20), FUNDED = "0x" + "cd".repeat(20);
 const EVIL = "\x1b[2J\x1b[1;1Hpwned\x1b]0;hijack\x07FAKE"; // hostile ANSI/OSC in server fields
 const TOKENS = [
   { ticker: "CAIRN", deployId: "0x" + "11".repeat(32), deployer: YOU, name: "Cairn" + EVIL, decimals: 8, supply: "2100000000000000", minted: "2100000000000000", mint: "issuer", height: 30279 },
@@ -122,8 +122,13 @@ const mock = await mkServer((req, res) => {
   if (u.pathname === "/cairnx/tokens") return json(res, 200, TOKENS);
   if (u.pathname === "/cairnx/token/CAIRN") return json(res, 200, { ...TOKENS[0], holders: Object.fromEntries(Array.from({ length: 12 }, (_, i) => [("0x" + String(i).padStart(2, "0").repeat(20)).slice(0, 42), { available: String((12 - i) * 100000000), locked: "0" }])) });
   if (u.pathname === "/cairnx/token/DEC0") return json(res, 200, { ...TOKENS[1], holders: { [ME]: { available: "100", locked: "0" } } });
+  // SCALE8 (F10): an 8-decimals token; its `decimals` is the UNauthenticated read-API value the CLI
+  // scales against. FUNDED holds a huge SCALE8 balance so both the (over-)scaled and the --base-units
+  // dry-runs pass the balance check and reach the printed canonical record.
+  if (u.pathname === "/cairnx/token/SCALE8") return json(res, 200, { ticker: "SCALE8", deployId: "0x" + "66".repeat(32), deployer: YOU, name: "Scaled", decimals: 8, supply: "100000000000000", minted: "100000000000000", mint: "issuer", height: 200, holders: { [FUNDED]: { available: "100000000000000", locked: "0" } } });
   if (u.pathname.startsWith("/cairnx/token/")) return json(res, 404, { ok: false, error: "unknown token" });
   if (u.pathname === `/cairnx/address/${ME}`) return json(res, 200, { address: ME, balances: { CAIRN: { available: "500000000", locked: "100000000" }, DEC0: { available: "100", locked: "0" } }, names: ["inverse", "stone-age"] });
+  if (u.pathname === `/cairnx/address/${FUNDED}`) return json(res, 200, { address: FUNDED, balances: { SCALE8: { available: "100000000000000", locked: "0" } }, names: [] });
   if (u.pathname.startsWith("/cairnx/address/")) return json(res, 200, { address: u.pathname.split("/").pop(), balances: {}, names: [] });
   if (u.pathname === "/cairnx/name/inverse") return json(res, 200, { name: "inverse", owner: ME, claimId: "0x" + "33".repeat(32), height: 30228, effectiveHeight: 30228, locked: false, offer: null });
   if (u.pathname === "/cairnx/name/leased") return json(res, 200, { name: "leased", owner: ME, claimId: "0x" + "44".repeat(32), height: 100, effectiveHeight: 100, locked: false, paidThroughEpoch: 2000, offer: { id: "0x" + "55".repeat(32), seller: ME, want: { value: "30000000" } } });
@@ -166,6 +171,28 @@ check("bad recipient rejected before any API/csd work", /bad recipient/.test((aw
 check("unknown ticker rejected", /unknown token/.test((await run(["token-send", "--ticker", "ZZZZ", "--to", YOU, "--amount", "1", "--address", ME, "--dry-run"], env)).out));
 check("missing flags → usage", /usage/.test((await run(["token-send"], env)).out));
 check("real-send path without csd → guides to install (after the printed record)", /`csd` not found/.test((await run(["token-send", "--ticker", "CAIRN", "--to", YOU, "--amount", "1", "--address", ME], env)).out));
+
+// ── F10 / CLI-C5: a lying `decimals` over-sends via the scaled path; --base-units bypasses it ──
+// The record uri printed by --dry-run carries the EXACT base-unit `amount` that would be anchored, so
+// asserting on it is asserting what would move on-chain. SCALE8 reports 8 decimals: sending "100" via
+// the scaled path anchors 100·10^8 = 10,000,000,000 base units (a hostile over-report inflates this
+// magnitude, invisibly in --yes/piped mode). --base-units anchors exactly "100" — the untrusted scale
+// is bypassed. Killing the --base-units branch makes the base-units run fall back to the scaled 1e10,
+// so the exact-"100" assertion is load-bearing (mutation-sensitive).
+console.log("\n— F10: lying decimals over-sends via the scaled path; --base-units sends exact base units —");
+const SCALED_URI = `{"amount":"10000000000","t":"transfer","ticker":"SCALE8","to":"${YOU}","v":1}`;
+const EXACT_URI  = `{"amount":"100","t":"transfer","ticker":"SCALE8","to":"${YOU}","v":1}`;
+const scaled = await run(["token-send", "--ticker", "SCALE8", "--to", YOU, "--amount", "100", "--address", FUNDED, "--yes", "--dry-run"], env);
+check("scaled path (--yes): 100 @ served 8 decimals anchors 10,000,000,000 base units (the over-send surface)", scaled.out.includes(SCALED_URI));
+const baseU = await run(["token-send", "--ticker", "SCALE8", "--to", YOU, "--amount", "100", "--base-units", "--address", FUNDED, "--yes", "--dry-run"], env);
+check("--base-units (--yes): anchors EXACTLY 100 base units (untrusted decimals scale bypassed)", baseU.out.includes(EXACT_URI));
+check("--base-units did NOT inflate to the scaled 1e10 (the flag is load-bearing)", !baseU.out.includes(SCALED_URI));
+check("--base-units surfaces that the decimals scale was bypassed", /--base-units/.test(baseU.out) && /bypassed/.test(baseU.out));
+check("--base-units rejects a fractional amount (base units are integers)", /must be a plain non-negative integer/.test((await run(["token-send", "--ticker", "SCALE8", "--to", YOU, "--amount", "1.5", "--base-units", "--address", FUNDED, "--dry-run"], env)).out));
+// --expect-decimals: a fail-closed second source on the untrusted served decimals.
+const expBad = await run(["token-send", "--ticker", "SCALE8", "--to", YOU, "--amount", "100", "--expect-decimals", "2", "--address", FUNDED, "--dry-run"], env);
+check("--expect-decimals mismatch REFUSES before scaling (fail-closed)", /refusing/i.test(expBad.out) && !expBad.out.includes(SCALED_URI) && !expBad.out.includes(EXACT_URI));
+check("--expect-decimals match proceeds (no false refusal on the honest path)", (await run(["token-send", "--ticker", "SCALE8", "--to", YOU, "--amount", "100", "--expect-decimals", "8", "--address", FUNDED, "--dry-run"], env)).out.includes(SCALED_URI));
 
 console.log("\n— names / name —");
 const nm = await run(["names", ME], env);
