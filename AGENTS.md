@@ -89,9 +89,9 @@ npm publish (public) with a transient mktemp --userconfig token, deleted immedia
 - send needs ONE confirmed UTXO covering amount+fee; fragmented wallets must consolidate first (a recurring user pain point).
 - All animation gates on TTY; piped output and e2e regexes depend on that; no unguarded ANSI.
 
-## State snapshot (2026-07-21, REBIND S-06; verify with git before trusting)
+## State snapshot (2026-07-23, post-REBIND LTS baseline; verify with git before trusting)
 
-Version 0.3.22, branch master, HEAD 6af70df (re-pin cairnx-core 0.1.38 for the v0.3.22 publish; check-consumer-pins passes). Pins verified current at snapshot: cairnx-core 0.1.38, csd-codec/csd-crypto 0.1.15, csd-registry 0.1.16. The cairnx-core 0.1.40 re-pin + patch release is a Plan 71 runbook step riding the ecosystem fan-out (the dominant pattern in this repo's history; never pin an unpublished version). Tags through v0.3.22. MIT.
+Version 0.3.23, branch master, HEAD a767898, PUBLISHED to npm 2026-07-21 (the cairnx-core 0.1.40 re-pin release; check-consumer-pins passes). Pins verified current at snapshot: cairnx-core 0.1.40, csd-codec/csd-crypto 0.1.15, csd-registry 0.1.16. Tags through v0.3.23. MIT.
 
 Plan 71 LTS perimeter note (NAMED residual, recorded in the campaign's residual register): cairn-cli is deliberately NOT deep-audited in the REBIND campaign. It was covered where cheap (this docs-truth pass + the re-pin discipline + its own pen-test suite), and its money paths keep their documented residual trust assumptions (CLI-C1 proxy-trusted input values with CAIRN_RPC unset; CLI-C5/F10 untrusted token decimals with the --base-units fund-safe automation path). Treat "not-deep-audited" as a standing fact when weighing changes here, not as silence.
 
