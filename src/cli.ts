@@ -86,6 +86,10 @@ function warnIfChangeCollapsed(inputValue: number, txValue: number, fee: number)
 // Defense layering: (1) if an independent node is configured we cryptographically catch an
 // under-report and REFUSE; (2) otherwise the value is proxy-trusted and the only backstop is the
 // feeSanity cap + the visible change line — the user is told to set CAIRN_RPC for a real check.
+// C-4: set from --allow-unverified-input in main(). The named availability valve for the
+// fail-closed-when-CAIRN_RPC-is-set-but-unreachable check in pickAndShow.
+let ALLOW_UNVERIFIED_INPUT = false;
+
 async function pickAndShow(addr: string, need: number, txValue: number, fee: number): Promise<string | null> {
   const picked = await api.pickInput(addr, need).catch(() => null);
   if (!picked) { console.log(err("no single confirmed UTXO covers this spend") + c.gray(" — fund this address, or consolidate (a node + `csd … --auto-input` can combine inputs).")); return null; }
@@ -97,6 +101,14 @@ async function pickAndShow(addr: string, need: number, txValue: number, fee: num
     return null;
   }
   const verified = (v as any).checked && (v as any).ok === true;
+  // C-4: the user configured an independent node (CAIRN_RPC) but the check couldn't RUN (it's
+  // unreachable or errored -> checked:false). Fail CLOSED - they opted into the control - rather
+  // than silently spending on the proxy's value. The UNSET default keeps today's warn-and-proceed
+  // UX exactly; --allow-unverified-input is the named valve for a configured-but-down node.
+  if (!verified && CAIRN_RPC && !ALLOW_UNVERIFIED_INPUT) {
+    console.log(err("your independent node (CAIRN_RPC) is unreachable, so the input value couldn't be verified — refusing to spend.") + c.gray(" Start your node, or pass --allow-unverified-input to proceed on the proxy's value."));
+    return null;
+  }
   const inputValue = verified ? Number((v as any).value) : picked.value;
   const tag = verified ? c.green(" ✓ verified vs your node")
             : (CAIRN_RPC ? c.gray(" (independent value check unavailable — CAIRN_RPC unreachable)") : c.gray(" (UNVERIFIED — set CAIRN_RPC)"));
@@ -349,7 +361,20 @@ async function cmdShow(a: Args) {
   console.log(`  ${kdim("support")}   ${csdFmt(total)} ${c.gray("from")} ${c.green(String(new Set((r.supports ?? []).map((s: any) => s.attester)).size))} ${c.gray("supporters")}`);
   console.log(`  ${kdim("proposer")}  ${c.gray(san(it.proposerHandle || it.proposer))}`);
   console.log(`  ${kdim("hash")}      ${c.magenta(san(it.payloadHash))}`);
-  console.log(`  ${kdim("integrity")} ${r.integrityOk ? ok("content matches commitment") : err("MISMATCH")}`);
+  // C-3: never render the SERVER's integrityOk as if it were OUR verdict — recompute the commitment
+  // locally over the raw served fields (the same buildCommitment cmdVerify uses; a pure local hash,
+  // no added network). The green tick must mean WE checked. If the recompute itself can't run
+  // (malformed served fields), say plainly that the claim is the server's.
+  let integrity: string;
+  try {
+    const local = buildCommitment({ v: 1, domain: it.domain, title: it.title, body: it.body, links: it.links ?? [] }).payloadHash;
+    integrity = local.toLowerCase() === String(it.payloadHash).toLowerCase()
+      ? ok("content matches commitment") + c.gray("  (recomputed locally)")
+      : err("MISMATCH — recomputed hash differs from the server's commitment");
+  } catch {
+    integrity = (r.integrityOk ? ok("content matches commitment") : err("MISMATCH")) + c.gray("  (the server's own claim — local recompute failed)");
+  }
+  console.log(`  ${kdim("integrity")} ${integrity}`);
 }
 
 async function cmdVerify(a: Args) {
@@ -699,6 +724,7 @@ async function help() {
 
 async function main() {
   const a = parse(process.argv.slice(2));
+  ALLOW_UNVERIFIED_INPUT = !!a.flags["allow-unverified-input"];
   switch (a._[0]) {
     case "domains": return cmdDomains();
     case "ls": case "list": case "top": return cmdList(a);

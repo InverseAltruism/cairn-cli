@@ -261,6 +261,15 @@ check("well-formed item verifies content (reaches the independence branch)", /ma
 check("same host + different port never asserts the trustless verdict", !/VERIFIED/.test(vPort) && !/via an independent/i.test(vPort));
 check("warns the RPC shares a host (so the user knows it's not a trustless check)", /shares a host/i.test(vPort));
 
+// ── C-3: `show` recomputes the commitment LOCALLY — the server's integrityOk is never rendered
+// as a local-looking green tick. The mock serves EVIL_ITEM (content does NOT hash to its forged
+// payloadHash) with integrityOk:true — the server LIES; pre-fix `show` printed the green tick anyway.
+console.log("\n— C-3: show's integrity row is a LOCAL recompute, not the server's claim —");
+const c3lie = (await run(["show", EVIL_ITEM.id], { CAIRN_API: API })).out;
+check("show flags the server's forged item as MISMATCH (local recompute, not the served integrityOk:true)", /MISMATCH/.test(c3lie));
+const c3good = (await run(["show", GOOD_ID], { CAIRN_API: API })).out;
+check("show passes a well-formed item and says WHO checked (recomputed locally)", /content matches commitment/.test(c3good) && /recomputed locally/i.test(c3good));
+
 console.log("\n— san() unit: strips control chars, keeps printable text —");
 const { san } = await import("../dist/lib/ui.js");
 const s = san("A\x1b[31m\x07B\x9bC\rD");
@@ -290,6 +299,15 @@ check("a world-writable explicit csd is honored but warned", wwRes.path === wwBi
 console.log("\n— UTXO-VALUE-1: a value mismatch vs the independent node (CAIRN_RPC) refuses the spend —");
 const xsrc = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED, CAIRN_RPC: RPC_DIFF_PORT })).out;
 check("send REFUSES on a proxy↔node input-value mismatch", /MISMATCH/i.test(xsrc) && !/\bsent\b/i.test(xsrc));
+
+// ── C-4: CAIRN_RPC set-but-unreachable FAILS CLOSED (not a silent spend on the proxy value) ──
+console.log("\n— C-4: a set-but-unreachable CAIRN_RPC refuses the spend (fail-closed) —");
+const DEAD_RPC = "http://127.0.0.1:9"; // nothing listens there
+const c4 = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED, CAIRN_RPC: DEAD_RPC })).out;
+check("set-but-unreachable CAIRN_RPC REFUSES the spend (fail-closed)", /unreachable/i.test(c4) && /refusing to spend/i.test(c4) && !/\bsent\b/i.test(c4));
+// the named valve: --allow-unverified-input proceeds past the refusal onto the proxy value
+const c4b = (await run(["send", "--to", "0x" + "cc".repeat(20), "--amount", "0.1", "--allow-unverified-input"], { ...CSDENV, CAIRN_CSD: MOCK_CSD_MINED, CAIRN_RPC: DEAD_RPC })).out;
+check("--allow-unverified-input is the availability valve (proceeds past the refusal)", !/refusing to spend/i.test(c4b));
 
 // ── H-7: a 'mined' status the independent node does NOT confirm is not asserted as on-chain ──
 console.log("\n— H-7: a proxy-only 'mined' reply is not asserted as confirmed-on-chain —");
