@@ -106,7 +106,7 @@ async function pickAndShow(addr: string, need: number, txValue: number, fee: num
   // than silently spending on the proxy's value. The UNSET default keeps today's warn-and-proceed
   // UX exactly; --allow-unverified-input is the named valve for a configured-but-down node.
   if (!verified && CAIRN_RPC && !ALLOW_UNVERIFIED_INPUT) {
-    console.log(err("your independent node (CAIRN_RPC) is unreachable, so the input value couldn't be verified — refusing to spend.") + c.gray(" Start your node, or pass --allow-unverified-input to proceed on the proxy's value."));
+    console.log(err("your independent node (CAIRN_RPC) is unreachable or couldn't answer, so the input value couldn't be verified — refusing to spend.") + c.gray(" Start your node, or pass --allow-unverified-input to proceed on the proxy's value."));
     return null;
   }
   const inputValue = verified ? Number((v as any).value) : picked.value;
