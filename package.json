@@ -1,6 +1,6 @@
 {
   "name": "@inversealtruism/cairn-cli",
-  "version": "0.3.24",
+  "version": "0.3.25",
   "description": "CLI for Compute Substrate / Cairn — browse the board/wall/network, and send CSD, propose, attest, and place stones non-custodially by driving your own installed `csd` wallet (cairn never holds your key; works node-less via the Cairn proxy).",
   "type": "module",
   "bin": {
@@ -41,7 +41,7 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "@inversealtruism/cairnx-core": "0.1.41",
+    "@inversealtruism/cairnx-core": "0.1.42",
     "@inversealtruism/csd-codec": "0.1.16",
     "@inversealtruism/csd-crypto": "0.1.15",
     "@inversealtruism/csd-registry": "0.1.17"
