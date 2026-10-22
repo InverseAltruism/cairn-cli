@@ -1,5 +1,16 @@
 # cairn-cli
 
+> Deprecated on npm on 2026-10-18 and no longer maintained. Use the Cairn Wallet or
+> [`@inversealtruism/cairn-sdk`](https://github.com/InverseAltruism/cairn-sdk) instead.
+>
+> Do not use it on mainnet. It drives your real `csd` wallet, and its CairnX record handling is pinned to
+> cairnx-core 0.1.42, so it will replay stale CairnX state once a later consensus gate activates. The registry
+> commands (`cairn gateway`, `cairn peer`, `cairn identity`) build records with `@inversealtruism/csd-registry`,
+> which has been removed (npm: "Removed under decision P-5 (2026-10-13)"), so they would pay fees into a retired
+> system. The Wall view calls `/api/wall`, which the Cairn site no longer serves (it answers 404).
+>
+> The rest of this file describes the tool as it was.
+
 A command-line client for **Compute Substrate / Cairn** - browse the board, and **send CSD,
 propose, attest, and place stones on the Wall** straight from your terminal.
 
