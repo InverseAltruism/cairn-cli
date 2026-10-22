@@ -1,9 +1,20 @@
 # cairn-cli
 
-> Onboarding briefing for coding agents and contributors. AGENTS.md is the canonical copy; CLAUDE.md imports it, so edit AGENTS.md only.
+> Deprecated on npm on 2026-10-18 and no longer maintained. Use the Cairn Wallet or
+> [`@inversealtruism/cairn-sdk`](https://github.com/InverseAltruism/cairn-sdk) instead.
+>
+> Do not use it on mainnet. It drives your real `csd` wallet, and its CairnX record handling is pinned to
+> cairnx-core 0.1.42, so it will replay stale CairnX state once a later consensus gate activates. The registry
+> commands (`cairn gateway`, `cairn peer`, `cairn identity`) build records with `@inversealtruism/csd-registry`,
+> which has been removed (npm: "Removed under decision P-5 (2026-10-13)"), so they would pay fees into a retired
+> system. The Wall view calls `/api/wall`, which the Cairn site no longer serves (it answers 404).
+>
+> The rest of this file describes the tool as it was. Do not cut a release, re-pin or publish.
+
+> Onboarding briefing for coding agents and contributors. AGENTS.md is the canonical copy; CLAUDE.md is a symlink to it.
 > Production and operations specifics are intentionally out of scope here and are maintained privately.
 
-`@inversealtruism/cairn-cli` (npm, v0.3.19, bin `cairn`) is the non-custodial terminal client for Compute Substrate / Cairn: browse the board/wall/network/quests, and send CSD / propose / attest / place Wall stones / send CairnX tokens, all without ever holding a private key. For writes it drives the user's own installed upstream `csd` wallet binary (which signs with CSD_SIG_V1); cairn-cli only orchestrates: computes canonical payload hashes, fetches a spendable input from the Cairn proxy (no local node needed), submits through the proxy, and registers off-chain content. Target user: people who'd rather not put a key in a browser extension. Sealed claims and Sign-in-with-CSD (SIWC) deliberately live in the Cairn Wallet, not here.
+`@inversealtruism/cairn-cli` (npm, bin `cairn`) is the non-custodial terminal client for Compute Substrate / Cairn: browse the board/wall/network/quests, and send CSD / propose / attest / place Wall stones / send CairnX tokens, all without ever holding a private key. For writes it drives the user's own installed upstream `csd` wallet binary (which signs with CSD_SIG_V1); cairn-cli only orchestrates: computes canonical payload hashes, fetches a spendable input from the Cairn proxy (no local node needed), submits through the proxy, and registers off-chain content. Target user: people who'd rather not put a key in a browser extension. Sealed claims and Sign-in-with-CSD (SIWC) deliberately live in the Cairn Wallet, not here.
 
 One exception to "never touches the key": the L3 registry commands (gateway register, peer announce, identity claim) sign a registry binding in-process via @inversealtruism/csd-registry, reading the privkey from `csd wallet config` (key never networked).
 
